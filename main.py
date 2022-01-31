@@ -221,7 +221,7 @@ def train_step(
 
 @jax.jit
 def get_gradient(model: ConditionalModel, x: jnp.ndarray):
-    ts = jnp.arange(model.timesteps, dtype=jnp.int32)
+    ts = jnp.arange(model.timesteps // 4, dtype=jnp.int32)
 
     @jax.vmap
     def f(t):
