@@ -1,0 +1,22 @@
+{
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "runArgs": [
+        "--privileged",
+        "--volume=/tmp/.X11-unix:/tmp/.X11-unix"
+    ],
+    "postCreateCommand": [
+        "bash",
+        "./.devcontainer/postCreateCommand.sh"
+    ],
+    "mounts": [],
+    "remoteEnv": {
+        "DISPLAY": ":1",
+        "QT_X11_NO_MITSHM": "1",
+    },
+    "extensions": [
+        "ms-python.python",
+        "github.copilot"
+    ]
+}

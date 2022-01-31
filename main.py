@@ -1,4 +1,5 @@
 from functools import partial
+from tkinter import N
 import typing as tp
 import einops
 
@@ -19,9 +20,12 @@ hdr_plot_style()
 
 class KeySeq(tx.KeySeq):
     def split(self, n: int = 2) -> "KeySeq":
-        key_seq = self.copy()
-        key_seq.key = jax.random.split(key_seq.key, n)
-        return key_seq
+        key = self()
+        return self.__class__(jax.random.split(key, n))
+
+    def advance(self) -> "KeySeq":
+        key = self()
+        return self.__class__(key)
 
 
 def get_data(size: int = 10**4, noise: float = 1.0):
@@ -54,7 +58,8 @@ def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2
 def simple_cond(
     pred: jnp.ndarray, vtrue: jnp.ndarray, vfalse: jnp.ndarray
 ) -> jnp.ndarray:
-    return pred * vtrue + (1 - pred) * vfalse
+    pred = pred.astype(np.float32)
+    return pred * vtrue + (1.0 - pred) * vfalse
 
 
 class Sampler(tx.Treex):
@@ -85,6 +90,7 @@ class Sampler(tx.Treex):
     def reverse_sample(
         self, model: "ConditionalModel", x: jnp.ndarray, t: jnp.ndarray
     ) -> jnp.ndarray:
+
         noise_pred = model(x, t)
 
         beta_t = self.beta[t][:, None]
@@ -102,6 +108,36 @@ class Sampler(tx.Treex):
 
         return x_tm1
 
+    def reverse_sample_vmap(
+        self, model: "ConditionalModel", x: jnp.ndarray, t: jnp.ndarray
+    ) -> jnp.ndarray:
+        def _sample_fn(
+            next_key: KeySeq,
+            x: jnp.ndarray,
+            t: jnp.ndarray,
+        ):
+            noise_pred = model(x[None], t[None])[0]
+
+            beta_t = self.beta[t]
+            alpha_t = self.alphas[t]
+            alpha_prod_t = self.alpha_prod[t]
+
+            assert t.shape == ()
+            assert beta_t.shape == ()
+
+            noise = jax.lax.cond(
+                t > 0,
+                lambda: jnp.sqrt(beta_t) * jax.random.normal(next_key(), shape=x.shape),
+                lambda: jnp.zeros_like(x),
+            )
+
+            weighted_noise_pred = beta_t / jnp.sqrt(1.0 - alpha_prod_t) * noise_pred
+            x_tm1 = (1.0 / jnp.sqrt(alpha_t)) * (x - weighted_noise_pred) + noise
+
+            return x_tm1
+
+        return jax.vmap(_sample_fn)(self.next_key.split(len(x)), x, t)
+
     @partial(jax.jit, static_argnums=(2, 3))
     def reverse_sample_loop(
         self,
@@ -110,7 +146,7 @@ class Sampler(tx.Treex):
     ) -> jnp.ndarray:
         def scan_fn(state: tp.Tuple[jnp.ndarray, Sampler], t: jnp.ndarray):
             x, sampler = state
-            x = sampler.reverse_sample(model, x, t)
+            x = sampler.reverse_sample_vmap(model, x, t)
             return (x, sampler), x
 
         x0 = jax.random.normal(self.next_key(), shape=sample_shape)
@@ -236,7 +272,7 @@ def main(
     timesteps: int = 1_000,
     batch_size: int = 128,
     n_samples: int = 8_000,
-    viz: bool = False,
+    viz: bool = True,
     plot_steps: int = 10_000,
     schedule: str = "sigmoid",
 ):
@@ -293,25 +329,38 @@ def main(
             # print loss
             print(noise_estimation_loss_jit(model, sampler, x_batch, t))
 
-            if viz:
-                x_seq = sampler.reverse_sample_loop(model, (2000, 2))
-                print("Plotting...")
+    if viz:
+        x_seq = sampler.reverse_sample_loop(model, (2000, 2))
+        print("Plotting...")
 
-                plot_trajectory(x_seq[::-1], n_plots=5, reverse=True)
+        plot_trajectory(x_seq[::-1], n_plots=5, reverse=True)
 
-                anim = make_animation(
-                    x_seq,
-                    model=model,
-                    data=X,
-                    forward=get_gradient,
-                    step_size=1,
-                    interval=10,
-                    xlim_scale=0.7,
-                    ylim_scale=0.7,
-                )
+        anim = make_animation(
+            x_seq,
+            model=model,
+            data=X,
+            forward=get_gradient,
+            step_size=1,
+            interval=10,
+            xlim_scale=0.7,
+            ylim_scale=0.7,
+        )
 
-                plot_gradients(model, X, get_gradient, width=0.001)
-                plt.show()
+        plot_gradients(model, X, get_gradient, width=0.001)
+        plt.show()
+
+        anim = make_animation(
+            x_seq,
+            model=model,
+            data=X,
+            forward=get_gradient,
+            step_size=1,
+            interval=10,
+            xlim_scale=0.7,
+            ylim_scale=0.7,
+        )
+        print("Saving animation...")
+        anim.save("sample.gif", writer="imagemagick")
 
 
 if __name__ == "__main__":

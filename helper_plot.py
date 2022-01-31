@@ -23,7 +23,7 @@ def plot_gradients(
     ).reshape(-1, 2)
     scores = forward(model, xx)
     scores_norm = np.linalg.norm(scores, axis=-1, ord=2, keepdims=True)
-    scores_log1p = scores / (scores_norm + 1e-9)  # * np.log1p(scores_norm)
+    scores_log1p = scores / (scores_norm + 1e-9) * np.log1p(scores_norm)
     # Perform the plots
 
     if plot_scatter:
