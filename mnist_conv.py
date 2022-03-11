@@ -371,6 +371,7 @@ def main(
 
                 # anim.save("sample.gif", writer="imagemagick")
 
+    return locals()
 
 if __name__ == "__main__":
     typer.run(main)
