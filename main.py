@@ -1,8 +1,8 @@
-from functools import partial
-from tkinter import N
 import typing as tp
-import einops
+from functools import partial
 
+import datasets
+import einops
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -28,10 +28,16 @@ class KeySeq(tx.KeySeq):
         return self.__class__(key)
 
 
-def get_data(size: int = 10**4, noise: float = 1.0):
+def get_data():
 
-    x, _ = make_swiss_roll(size, noise=noise)
-    x = x[:, [0, 2]] / 10.0
+    ds = datasets.load.load_dataset("mnist")
+    ds.set_format("numpy")
+    x = np.stack(ds["train"]["image"])[..., None]
+    x = x.astype(np.float32)
+
+    # normalize -1 to 1
+    x = x / 255.0
+    x = (x - 0.5) * 2.0
 
     return x
 
@@ -127,8 +133,10 @@ class Sampler(tx.Treex):
 
             noise = jax.lax.cond(
                 t > 0,
-                lambda: jnp.sqrt(beta_t) * jax.random.normal(next_key(), shape=x.shape),
-                lambda: jnp.zeros_like(x),
+                lambda _: jnp.sqrt(beta_t)
+                * jax.random.normal(next_key(), shape=x.shape),
+                lambda _: jnp.zeros_like(x),
+                None,
             )
 
             weighted_noise_pred = beta_t / jnp.sqrt(1.0 - alpha_prod_t) * noise_pred
@@ -192,27 +200,35 @@ class EMA(tx.Treex):
 class ConditionalLinear(tx.Module):
     def __init__(self, num_out, n_steps):
         self.num_out = num_out
-        self.lin = tx.Linear(num_out)
+        self.conv = tx.Conv(num_out, [5, 5])
         self.embed = tx.Embed(n_steps, num_out)
 
     def __call__(self, x, t):
-        return self.lin(x) + self.embed(t)
+        return self.conv(x) + self.embed(t)[:, None, None, :]
 
 
 class ConditionalModel(tx.Module):
     def __init__(self, timesteps: int):
-        super(ConditionalModel, self).__init__()
-        self.lin1 = ConditionalLinear(128, timesteps)
-        self.lin2 = ConditionalLinear(128, timesteps)
-        self.lin3 = ConditionalLinear(128, timesteps)
-        self.lin4 = tx.Linear(2)
         self.timesteps = timesteps
 
+    @tx.compact
     def __call__(self, x, t):
-        x = jax.nn.softplus(self.lin1(x, t))
-        x = jax.nn.softplus(self.lin2(x, t))
-        x = jax.nn.softplus(self.lin3(x, t))
-        return self.lin4(x)
+        x = ConditionalLinear(32, self.timesteps)(x, t)
+        x = jax.nn.softplus(x)
+
+        x = ConditionalLinear(32, self.timesteps)(x, t)
+        x = jax.nn.softplus(x)
+
+        x = ConditionalLinear(32, self.timesteps)(x, t)
+        x = jax.nn.softplus(x)
+
+        x = ConditionalLinear(32, self.timesteps)(x, t)
+        x = jax.nn.softplus(x)
+
+        x = ConditionalLinear(32, self.timesteps)(x, t)
+        x = jax.nn.softplus(x)
+
+        return tx.Conv(1, [5, 5])(x)
 
 
 def plot_trajectory(
@@ -235,7 +251,7 @@ def plot_trajectory(
 
     for plot_i, (i, t) in enumerate(zip(idxs, ts)):
         cur_x = x_seq[i]
-        axs[plot_i].scatter(cur_x[:, 0], cur_x[:, 1], s=10)
+        axs[plot_i].imshow(cur_x.squeeze(), cmap="gray")
         axs[plot_i].set_axis_off()
         axs[plot_i].set_title("$q(\mathbf{x}_{" + str(t) + "})$")
 
@@ -274,13 +290,20 @@ def main(
     n_samples: int = 8_000,
     viz: bool = True,
     plot_steps: int = 10_000,
-    schedule: str = "sigmoid",
+    schedule: str = "squared",
+    tpu: bool = False,
 ):
-    X = get_data(size=n_samples)
+    if tpu:
+        import jax.tools.colab_tpu
 
-    # Plot it
-    plt.figure(figsize=(16, 12))
-    plt.scatter(X[:, 0], X[:, 1], alpha=0.5, color="red", edgecolor="white", s=40)
+        jax.tools.colab_tpu.setup_tpu()
+    X = get_data()
+
+    # plot 8 random mnist images using subplots
+    fig, ax = plt.subplots(2, 4, figsize=(12, 6))
+    for i in range(8):
+        ax[i // 4, i % 4].imshow(X[i].squeeze(), cmap="gray")
+        ax[i // 4, i % 4].set_axis_off()
 
     # Noise schedule
     beta = make_beta_schedule(
@@ -291,23 +314,19 @@ def main(
 
     sampler = Sampler(beta, seed=42)
 
-    x_seq = np.stack(
-        [
-            sampler.forward_sample(X, t)[0]
-            for t in einops.repeat(
-                np.linspace(0, timesteps - 1, 10).astype(np.int32),
-                "... ->  ... batch",
-                batch=X.shape[0],
-            )
-        ]
-    )
+    x_seq = sampler.forward_sample(
+        einops.repeat(X[0], "... -> batch ...", batch=timesteps),
+        np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
+    )[0]
+
     plot_trajectory(x_seq, n_plots=5, max_timestep=timesteps)
 
     if viz:
         plt.show()
 
-    t_init = np.random.randint(0, timesteps, size=X.shape[0])
-    model = ConditionalModel(timesteps).init(42, (X, t_init))
+    t_init = np.random.randint(0, timesteps, size=batch_size)
+    model = ConditionalModel(timesteps).init(42, (X[:batch_size], t_init))
+    print(model.tabulate((X[:batch_size], t_init)))
     optimizer = tx.Optimizer(
         optax.chain(
             optax.clip_by_global_norm(1.0),
@@ -329,39 +348,30 @@ def main(
             # print loss
             print(noise_estimation_loss_jit(model, sampler, x_batch, t))
 
-    if viz:
-        x_seq = sampler.reverse_sample_loop(model, (2000, 2))
-        print("Plotting...")
+            if viz:
+                x_seq = sampler.reverse_sample_loop(model, (1, 28, 28, 1))
+                print("Plotting...")
 
-        plot_trajectory(x_seq[::-1], n_plots=5, reverse=True)
+                # print(x_seq[-1])
 
-        anim = make_animation(
-            x_seq,
-            model=model,
-            data=X,
-            forward=get_gradient,
-            step_size=1,
-            interval=10,
-            xlim_scale=0.7,
-            ylim_scale=0.7,
-        )
+                plot_trajectory(x_seq[::-1][:, 0], n_plots=7, reverse=True)
 
-        plot_gradients(model, X, get_gradient, width=0.001)
-        plt.show()
+                # anim = make_animation(
+                #     x_seq,
+                #     model=model,
+                #     data=X,
+                #     forward=get_gradient,
+                #     step_size=1,
+                #     interval=10,
+                #     xlim_scale=0.7,
+                #     ylim_scale=0.7,
+                # )
 
-        anim = make_animation(
-            x_seq,
-            model=model,
-            data=X,
-            forward=get_gradient,
-            step_size=1,
-            interval=10,
-            xlim_scale=0.7,
-            ylim_scale=0.7,
-        )
-        print("Saving animation...")
-        anim.save("sample.gif", writer="imagemagick")
+                plt.show()
 
+                # anim.save("sample.gif", writer="imagemagick")
+
+    return locals()
 
 if __name__ == "__main__":
     typer.run(main)
