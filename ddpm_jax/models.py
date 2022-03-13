@@ -1,4 +1,5 @@
 import dataclasses
+from functools import partial
 from inspect import isfunction
 import typing as tp
 from chex import dataclass
@@ -291,3 +292,120 @@ class UNet(nn.Module):
             x
 
         return self.final_conv(x)
+
+
+@ft.dataclass
+class GaussianDiffusion(ft.Immutable):
+    beta: jnp.ndarray = ft.node()
+    alpha: jnp.ndarray = ft.node()
+    alpha_prod: jnp.ndarray = ft.node()
+
+    @classmethod
+    def new(cls, beta: np.ndarray) -> "GaussianDiffusion":
+        beta = jnp.asarray(beta)
+        alphas = 1.0 - beta
+        alpha_prod = jnp.cumprod(alphas)
+
+        return cls(beta, alphas, alpha_prod)
+
+    def forward_sample(
+        self, key: jnp.ndarray, x: jnp.ndarray, t: jnp.ndarray
+    ) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
+        def _sample_fn(key: jnp.ndarray, x: jnp.ndarray, t: jnp.ndarray):
+            alpha_prod_t: jnp.ndarray = self.alpha_prod[t]
+            assert alpha_prod_t.shape == ()
+            noise = jax.random.normal(key, shape=x.shape)
+            xt = jnp.sqrt(alpha_prod_t) * x + jnp.sqrt(1.0 - alpha_prod_t) * noise
+
+            return xt, noise
+
+        key = jax.random.split(key, len(x))
+        return jax.vmap(_sample_fn)(key, x, t)
+
+    def reverse_sample(
+        self,
+        key: jnp.ndarray,
+        model: ft.ModuleManager[nn.Module],
+        x: jnp.ndarray,
+        t: jnp.ndarray,
+    ) -> jnp.ndarray:
+
+        noise_pred = model(None, x, t)[0]
+
+        beta_t: jnp.ndarray = self.beta[t][:, None, None, None]
+        alpha_t: jnp.ndarray = self.alpha[t][:, None, None, None]
+        alpha_prod_t: jnp.ndarray = self.alpha_prod[t][:, None, None, None]
+
+        noise = jnp.where(
+            t[:, None, None, None] > 0,
+            jnp.sqrt(beta_t) * jax.random.normal(self.key(), shape=x.shape),
+            jnp.zeros_like(x),
+        )
+
+        weighted_noise_pred = beta_t / jnp.sqrt(1.0 - alpha_prod_t) * noise_pred
+        x_next = (1.0 / jnp.sqrt(alpha_t)) * (x - weighted_noise_pred) + noise
+
+        return x_next
+
+    def reverse_sample_vmap(
+        self,
+        key: jnp.ndarray,
+        model: ft.ModuleManager[nn.Module],
+        x: jnp.ndarray,
+        t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        NOTE: Here we use vmap to "simplify" the logic, by using per-sample calculations
+        variables like `beta_t` are scalars which as a result broadcast for free.
+        """
+
+        def _sample_fn(
+            key: jnp.ndarray,
+            noise_pred: jnp.ndarray,
+            x: jnp.ndarray,
+            t: jnp.ndarray,
+        ):
+
+            beta_t: jnp.ndarray = self.beta[t]
+            alpha_t: jnp.ndarray = self.alpha[t]
+            alpha_prod_t: jnp.ndarray = self.alpha_prod[t]
+
+            assert t.shape == ()
+            assert beta_t.shape == ()
+
+            noise = jax.lax.cond(
+                t > 0,
+                lambda: jnp.sqrt(beta_t) * jax.random.normal(key, shape=x.shape),
+                lambda: jnp.zeros_like(x),
+            )
+
+            weighted_noise_pred = beta_t / jnp.sqrt(1.0 - alpha_prod_t) * noise_pred
+            x_next = (1.0 / jnp.sqrt(alpha_t)) * (x - weighted_noise_pred) + noise
+
+            return x_next
+
+        noise_pred = model(None, x, t)[0]
+        key = jax.random.split(key, len(x))
+        return jax.vmap(_sample_fn)(key, noise_pred, x, t)
+
+    @partial(jax.jit, static_argnums=(2, 3))
+    def reverse_sample_loop(
+        self,
+        key: jnp.ndarray,
+        model: ft.ModuleManager[nn.Module],
+        sample_shape: tp.Tuple[int, ...],
+    ) -> jnp.ndarray:
+        def scan_fn(x: jnp.ndarray, keys_ts: tp.Tuple[jnp.ndarray, jnp.ndarray]):
+            key, t = keys_ts
+            x = self.reverse_sample_vmap(key, model, x, t)
+            return x, x
+
+        n_steps = len(self.beta)
+        key, normal_key = jax.random.split(key)
+        x0 = jax.random.normal(normal_key, shape=sample_shape)
+
+        t = jnp.arange(n_steps)[::-1]
+        t = einop(t, "... ->  ... batch", batch=sample_shape[0])
+        keys = jax.random.split(key, n_steps)
+
+        return jax.lax.scan(scan_fn, x0, (keys, t))[1]

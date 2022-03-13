@@ -14,7 +14,7 @@ from sklearn.datasets import make_swiss_roll
 from tqdm import tqdm
 
 from ddpm_jax.helper_plot import hdr_plot_style, make_animation, plot_gradients
-from ddpm_jax.models import EMA, Resize, UNet
+from ddpm_jax.models import EMA, GaussianDiffusion, Resize, UNet
 
 hdr_plot_style()
 
@@ -52,112 +52,6 @@ def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2
     else:
         raise ValueError(f"Unknown schedule {schedule}")
     return np.asarray(betas)
-
-
-def simple_cond(
-    pred: jnp.ndarray, vtrue: jnp.ndarray, vfalse: jnp.ndarray
-) -> jnp.ndarray:
-    pred = pred.astype(np.float32)
-    return pred * vtrue + (1.0 - pred) * vfalse
-
-
-@ft.dataclass
-class GaussianDiffusion(ft.Immutable):
-    beta: jnp.ndarray = ft.node()
-    alpha: jnp.ndarray = ft.node()
-    alpha_prod: jnp.ndarray = ft.node()
-
-    @classmethod
-    def new(cls, beta: np.ndarray) -> "GaussianDiffusion":
-        beta = jnp.asarray(beta)
-        alphas = 1.0 - beta
-        alpha_prod = jnp.cumprod(alphas)
-
-        return cls(beta, alphas, alpha_prod)
-
-    def forward_sample(
-        self, key: jnp.ndarray, x: jnp.ndarray, t: jnp.ndarray
-    ) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
-        def _sample_fn(key: jnp.ndarray, x: jnp.ndarray, t: jnp.ndarray):
-            alpha_prod_t: jnp.ndarray = self.alpha_prod[t]
-            assert alpha_prod_t.shape == ()
-            noise = jax.random.normal(key, shape=x.shape)
-            xt = jnp.sqrt(alpha_prod_t) * x + jnp.sqrt(1.0 - alpha_prod_t) * noise
-
-            return xt, noise
-
-        key = jax.random.split(key, len(x))
-        return jax.vmap(_sample_fn)(key, x, t)
-
-    def reverse_sample(
-        self, model: "Model", x: jnp.ndarray, t: jnp.ndarray
-    ) -> jnp.ndarray:
-
-        noise_pred = model(x, t)
-
-        beta_t = self.beta[t][:, None]
-        alpha_t = self.alphas[t][:, None]
-        alpha_prod_t = self.alpha_prod[t][:, None]
-
-        noise = jnp.where(
-            t[:, None] > 0,
-            jnp.sqrt(beta_t) * jax.random.normal(self.key(), shape=x.shape),
-            jnp.zeros_like(x),
-        )
-
-        weighted_noise_pred = beta_t / jnp.sqrt(1.0 - alpha_prod_t) * noise_pred
-        x_tm1 = (1.0 / jnp.sqrt(alpha_t)) * (x - weighted_noise_pred) + noise
-
-        return x_tm1
-
-    def reverse_sample_vmap(
-        self, model: "Model", x: jnp.ndarray, t: jnp.ndarray
-    ) -> jnp.ndarray:
-        def _sample_fn(
-            next_key: KeySeq,
-            x: jnp.ndarray,
-            t: jnp.ndarray,
-        ):
-            noise_pred = model(x[None], t[None])[0]
-
-            beta_t = self.beta[t]
-            alpha_t = self.alphas[t]
-            alpha_prod_t = self.alpha_prod[t]
-
-            assert t.shape == ()
-            assert beta_t.shape == ()
-
-            noise = jax.lax.cond(
-                t > 0,
-                lambda _: jnp.sqrt(beta_t)
-                * jax.random.normal(next_key(), shape=x.shape),
-                lambda _: jnp.zeros_like(x),
-                None,
-            )
-
-            weighted_noise_pred = beta_t / jnp.sqrt(1.0 - alpha_prod_t) * noise_pred
-            x_tm1 = (1.0 / jnp.sqrt(alpha_t)) * (x - weighted_noise_pred) + noise
-
-            return x_tm1
-
-        return jax.vmap(_sample_fn)(self.key.split(len(x)), x, t)
-
-    @partial(jax.jit, static_argnums=(2, 3))
-    def reverse_sample_loop(
-        self,
-        model: "Model",
-        sample_shape: tp.Tuple[int, ...],
-    ) -> jnp.ndarray:
-        def scan_fn(state: tp.Tuple[jnp.ndarray, GaussianDiffusion], t: jnp.ndarray):
-            x, sampler = state
-            x = sampler.reverse_sample_vmap(model, x, t)
-            return (x, sampler), x
-
-        x0 = jax.random.normal(self.key(), shape=sample_shape)
-        t = jnp.arange(len(self.beta))[::-1]
-        t = einop(t, "... ->  ... batch", batch=sample_shape[0])
-
-        return jax.lax.scan(scan_fn, (x0, self), t)[1]
 
 
 def noise_estimation_loss(
@@ -212,11 +106,11 @@ def plot_trajectory(
 
 @jax.jit
 def train_step(
+    key: jnp.ndarray,
     model: Model,
     optimizer: ft.Optimizer,
     sampler: GaussianDiffusion,
     ema: EMA,
-    key: jnp.ndarray,
     x: jnp.ndarray,
     t: jnp.ndarray,
 ):
@@ -239,6 +133,31 @@ def get_gradient(model: Model, x: jnp.ndarray):
     return f(ts).mean(axis=0)
 
 
+def plot_data(
+    key: jnp.ndarray,
+    X: np.ndarray,
+    timesteps: int,
+    beta: np.ndarray,
+    sampler: GaussianDiffusion,
+):
+    x_seq = sampler.forward_sample(
+        key,
+        einop(X[0], "... -> batch ...", batch=timesteps),
+        np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
+    )[0]
+
+    plot_trajectory(x_seq, n_plots=5, max_timestep=timesteps)
+
+    # plot 8 random mnist images using subplots
+    fig, ax = plt.subplots(2, 4, figsize=(12, 6))
+    for i in range(8):
+        ax[i // 4, i % 4].imshow(X[i].squeeze(), cmap="gray")
+        ax[i // 4, i % 4].set_axis_off()
+
+    plt.figure(figsize=(16, 12))
+    plt.scatter(np.arange(timesteps), beta)
+
+
 def main(
     steps: int = 100_000,
     timesteps: int = 1_000,
@@ -258,52 +177,37 @@ def main(
     X = get_data()
     X = np.asarray(Resize(image_shape)(X))
     key = ft.Key(42)
-
-    # plot 8 random mnist images using subplots
-    fig, ax = plt.subplots(2, 4, figsize=(12, 6))
-    for i in range(8):
-        ax[i // 4, i % 4].imshow(X[i].squeeze(), cmap="gray")
-        ax[i // 4, i % 4].set_axis_off()
-
-    # Noise schedule
     beta = make_beta_schedule(
         schedule=schedule, n_timesteps=timesteps, start=1e-5, end=1e-2
     )
-    plt.figure(figsize=(16, 12))
-    plt.scatter(np.arange(timesteps), beta)
 
-    sampler = GaussianDiffusion.new(beta)
+    time_sample = np.random.randint(0, timesteps, size=batch_size)
+    x_sample = X[:batch_size]
 
-    key, key_forward = jax.random.split(key)
-    x_seq = sampler.forward_sample(
-        key_forward,
-        einop(X[0], "... -> batch ...", batch=timesteps),
-        np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
-    )[0]
-
-    plot_trajectory(x_seq, n_plots=5, max_timestep=timesteps)
-
-    if viz:
-        plt.show()
-
-    t_init = np.random.randint(0, timesteps, size=batch_size)
-    model = Model(timesteps).init(42, (X[:batch_size], t_init))
-    print(model.tabulate((X[:batch_size], t_init)))
+    model = ft.ModuleManager.new(UNet(dim=32, channels=1)).init(
+        42, x_sample, time_sample
+    )
     optimizer = ft.Optimizer(
         optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.adamw(3e-3),
         )
-    ).init(model)
-    ema = EMA(model, mu=0.9)
+    ).init(model["params"])
+    sampler = GaussianDiffusion.new(beta)
+    ema = EMA(model["params"], mu=0.9)
+
+    if viz:
+        plot_data(key=key, X=X, timesteps=timesteps, beta=beta, sampler=sampler)
+        plt.show()
 
     for i in tqdm(range(steps + 1)):
         batch_idxs = np.random.choice(len(X), size=batch_size, replace=False)
         x_batch = X[batch_idxs]
         t = np.random.randint(0, timesteps, size=batch_size)
 
+        key, key_step = jax.random.split(key)
         model, optimizer, sampler, ema = train_step(
-            model, optimizer, sampler, ema, x_batch, t
+            key_step, model, optimizer, sampler, ema, x_batch, t
         )
 
         if i % plot_steps == 0:
