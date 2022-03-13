@@ -2,7 +2,6 @@ import typing as tp
 from functools import partial
 
 import datasets
-from einop import einop
 import flax_tools as ft
 import jax
 import jax.numpy as jnp
@@ -10,11 +9,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import typer
+from einop import einop
 from sklearn.datasets import make_swiss_roll
 from tqdm import tqdm
 
 from ddpm_jax.helper_plot import hdr_plot_style, make_animation, plot_gradients
-from ddpm_jax.models import UNet, EMA
+from ddpm_jax.models import EMA, Resize, UNet
 
 hdr_plot_style()
 
@@ -248,12 +248,16 @@ def main(
     plot_steps: int = 10_000,
     schedule: str = "squared",
     tpu: bool = False,
+    image_shape: tp.List[int] = (32, 32),
 ):
     if tpu:
-        import jax.tools.colab_tpu
+        from jax.tools import colab_tpu
 
-        jax.tools.colab_tpu.setup_tpu()
+        colab_tpu.setup_tpu()
+
     X = get_data()
+    X = np.asarray(Resize(image_shape)(X))
+    key = ft.Key(42)
 
     # plot 8 random mnist images using subplots
     fig, ax = plt.subplots(2, 4, figsize=(12, 6))
@@ -270,7 +274,9 @@ def main(
 
     sampler = GaussianDiffusion.new(beta)
 
+    key, key_forward = jax.random.split(key)
     x_seq = sampler.forward_sample(
+        key_forward,
         einop(X[0], "... -> batch ...", batch=timesteps),
         np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
     )[0]

@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from einop import einop
-from this import d
 
 A = tp.TypeVar("A")
 ArrayFn = tp.Callable[[jnp.ndarray], jnp.ndarray]
@@ -177,7 +176,26 @@ class LinearAttention(nn.Module):
         return self.to_out(out)
 
 
-# model
+def Resize(
+    sample_shape: tp.Sequence[int],
+    method: jax.image.ResizeMethod = jax.image.ResizeMethod.LINEAR,
+    antialias: bool = True,
+    precision=jax.lax.Precision.HIGHEST,
+) -> ArrayFn:
+    def _resize(x: jnp.ndarray) -> jnp.ndarray:
+        batch_dims = len(x.shape) - len(sample_shape) - 1  # 1 = channel dim
+        shape = (*x.shape[:batch_dims], *sample_shape, x.shape[-1])
+        output = jax.image.resize(
+            x,
+            shape=shape,
+            method=method,
+            antialias=antialias,
+            precision=precision,
+        )
+
+        return output
+
+    return _resize
 
 
 @dataclasses.dataclass
