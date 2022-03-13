@@ -2,30 +2,23 @@ import typing as tp
 from functools import partial
 
 import datasets
-import einops
+from einop import einop
+import flax_tools as ft
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-import treex as tx
 import typer
 from sklearn.datasets import make_swiss_roll
 from tqdm import tqdm
 
-from helper_plot import hdr_plot_style, make_animation, plot_gradients
+from ddpm_jax.helper_plot import hdr_plot_style, make_animation, plot_gradients
+from ddpm_jax.models import UNet, EMA
 
 hdr_plot_style()
 
-
-class KeySeq(tx.KeySeq):
-    def split(self, n: int = 2) -> "KeySeq":
-        key = self()
-        return self.__class__(jax.random.split(key, n))
-
-    def advance(self) -> "KeySeq":
-        key = self()
-        return self.__class__(key)
+Model = ft.ModuleManager[UNet]
 
 
 def get_data():
@@ -68,33 +61,36 @@ def simple_cond(
     return pred * vtrue + (1.0 - pred) * vfalse
 
 
-class Sampler(tx.Treex):
-    beta: jnp.ndarray = tx.node()
-    alpha: jnp.ndarray = tx.node()
-    alpha_prod: jnp.ndarray = tx.node()
-    next_key: KeySeq = tx.node()
+@ft.dataclass
+class GaussianDiffusion(ft.Immutable):
+    beta: jnp.ndarray = ft.node()
+    alpha: jnp.ndarray = ft.node()
+    alpha_prod: jnp.ndarray = ft.node()
 
-    def __init__(self, beta: np.ndarray, seed: int = 42) -> None:
-        self.beta = jnp.asarray(beta)
-        self.alphas = 1.0 - self.beta
-        self.alpha_prod = jnp.cumprod(self.alphas)
-        self.next_key = KeySeq(seed)
+    @classmethod
+    def new(cls, beta: np.ndarray) -> "GaussianDiffusion":
+        beta = jnp.asarray(beta)
+        alphas = 1.0 - beta
+        alpha_prod = jnp.cumprod(alphas)
+
+        return cls(beta, alphas, alpha_prod)
 
     def forward_sample(
-        self, x: jnp.ndarray, t: jnp.ndarray
+        self, key: jnp.ndarray, x: jnp.ndarray, t: jnp.ndarray
     ) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
-        def _sample_fn(next_key: KeySeq, x: jnp.ndarray, t: jnp.ndarray):
-            alpha_prod_t = self.alpha_prod[t]
+        def _sample_fn(key: jnp.ndarray, x: jnp.ndarray, t: jnp.ndarray):
+            alpha_prod_t: jnp.ndarray = self.alpha_prod[t]
             assert alpha_prod_t.shape == ()
-            noise = jax.random.normal(next_key(), shape=x.shape)
+            noise = jax.random.normal(key, shape=x.shape)
             xt = jnp.sqrt(alpha_prod_t) * x + jnp.sqrt(1.0 - alpha_prod_t) * noise
 
             return xt, noise
 
-        return jax.vmap(_sample_fn)(self.next_key.split(len(x)), x, t)
+        key = jax.random.split(key, len(x))
+        return jax.vmap(_sample_fn)(key, x, t)
 
     def reverse_sample(
-        self, model: "ConditionalModel", x: jnp.ndarray, t: jnp.ndarray
+        self, model: "Model", x: jnp.ndarray, t: jnp.ndarray
     ) -> jnp.ndarray:
 
         noise_pred = model(x, t)
@@ -105,7 +101,7 @@ class Sampler(tx.Treex):
 
         noise = jnp.where(
             t[:, None] > 0,
-            jnp.sqrt(beta_t) * jax.random.normal(self.next_key(), shape=x.shape),
+            jnp.sqrt(beta_t) * jax.random.normal(self.key(), shape=x.shape),
             jnp.zeros_like(x),
         )
 
@@ -115,7 +111,7 @@ class Sampler(tx.Treex):
         return x_tm1
 
     def reverse_sample_vmap(
-        self, model: "ConditionalModel", x: jnp.ndarray, t: jnp.ndarray
+        self, model: "Model", x: jnp.ndarray, t: jnp.ndarray
     ) -> jnp.ndarray:
         def _sample_fn(
             next_key: KeySeq,
@@ -144,91 +140,49 @@ class Sampler(tx.Treex):
 
             return x_tm1
 
-        return jax.vmap(_sample_fn)(self.next_key.split(len(x)), x, t)
+        return jax.vmap(_sample_fn)(self.key.split(len(x)), x, t)
 
     @partial(jax.jit, static_argnums=(2, 3))
     def reverse_sample_loop(
         self,
-        model: "ConditionalModel",
+        model: "Model",
         sample_shape: tp.Tuple[int, ...],
     ) -> jnp.ndarray:
-        def scan_fn(state: tp.Tuple[jnp.ndarray, Sampler], t: jnp.ndarray):
+        def scan_fn(state: tp.Tuple[jnp.ndarray, GaussianDiffusion], t: jnp.ndarray):
             x, sampler = state
             x = sampler.reverse_sample_vmap(model, x, t)
             return (x, sampler), x
 
-        x0 = jax.random.normal(self.next_key(), shape=sample_shape)
+        x0 = jax.random.normal(self.key(), shape=sample_shape)
         t = jnp.arange(len(self.beta))[::-1]
-        t = einops.repeat(t, "... ->  ... batch", batch=sample_shape[0])
+        t = einop(t, "... ->  ... batch", batch=sample_shape[0])
 
         return jax.lax.scan(scan_fn, (x0, self), t)[1]
 
 
 def noise_estimation_loss(
-    model: "ConditionalModel",
-    sampler: Sampler,
+    params: tp.Optional[tp.Any],
+    model: "Model",
+    sampler: GaussianDiffusion,
+    key: jnp.ndarray,
     x: jnp.ndarray,
     t: jnp.ndarray,
 ):
+    preds: jnp.ndarray
+    key_sample, key_model = jax.random.split(key, 2)
+
+    if params is not None:
+        model = model.update(params=params)
 
     # model input
-    xt, noise = sampler.forward_sample(x, t)
+    xt, noise = sampler.forward_sample(key_sample, x, t)
 
-    noise_pred = model(xt, t)
+    preds, model = model(key_model, xt, t)
 
-    return ((noise - noise_pred) ** 2).mean()
+    return jnp.mean((noise - preds) ** 2)
 
 
 noise_estimation_loss_jit = jax.jit(noise_estimation_loss)
-
-
-class EMA(tx.Treex):
-    params: tx.Module = tx.node()
-
-    def __init__(self, params, mu=0.999):
-        self.mu = mu
-        self.params = params
-
-    def update(self, new_params):
-        self.params = jax.tree_map(self.ema, self.params, new_params)
-        return self.params
-
-    def ema(self, params, new_params):
-        return self.mu * params + (1.0 - self.mu) * new_params
-
-
-class ConditionalLinear(tx.Module):
-    def __init__(self, num_out, n_steps):
-        self.num_out = num_out
-        self.conv = tx.Conv(num_out, [5, 5])
-        self.embed = tx.Embed(n_steps, num_out)
-
-    def __call__(self, x, t):
-        return self.conv(x) + self.embed(t)[:, None, None, :]
-
-
-class ConditionalModel(tx.Module):
-    def __init__(self, timesteps: int):
-        self.timesteps = timesteps
-
-    @tx.compact
-    def __call__(self, x, t):
-        x = ConditionalLinear(32, self.timesteps)(x, t)
-        x = jax.nn.softplus(x)
-
-        x = ConditionalLinear(32, self.timesteps)(x, t)
-        x = jax.nn.softplus(x)
-
-        x = ConditionalLinear(32, self.timesteps)(x, t)
-        x = jax.nn.softplus(x)
-
-        x = ConditionalLinear(32, self.timesteps)(x, t)
-        x = jax.nn.softplus(x)
-
-        x = ConditionalLinear(32, self.timesteps)(x, t)
-        x = jax.nn.softplus(x)
-
-        return tx.Conv(1, [5, 5])(x)
 
 
 def plot_trajectory(
@@ -258,21 +212,23 @@ def plot_trajectory(
 
 @jax.jit
 def train_step(
-    model: ConditionalModel,
-    optimizer: tx.Optimizer,
-    sampler: Sampler,
+    model: Model,
+    optimizer: ft.Optimizer,
+    sampler: GaussianDiffusion,
     ema: EMA,
+    key: jnp.ndarray,
     x: jnp.ndarray,
     t: jnp.ndarray,
 ):
-    grads = jax.grad(noise_estimation_loss)(model, sampler, x, t)
-    model = optimizer.update(grads, model)
-    model = ema.update(model)
+    params = model["params"]
+    grads = jax.grad(noise_estimation_loss)(params, model, sampler, key, x, t)
+    model, optimizer = optimizer.update(grads, model)
+    model, ema = ema.update(model)
     return model, optimizer, sampler, ema
 
 
 @jax.jit
-def get_gradient(model: ConditionalModel, x: jnp.ndarray):
+def get_gradient(model: Model, x: jnp.ndarray):
     ts = jnp.arange(model.timesteps // 4, dtype=jnp.int32)
 
     @jax.vmap
@@ -312,10 +268,10 @@ def main(
     plt.figure(figsize=(16, 12))
     plt.scatter(np.arange(timesteps), beta)
 
-    sampler = Sampler(beta, seed=42)
+    sampler = GaussianDiffusion.new(beta)
 
     x_seq = sampler.forward_sample(
-        einops.repeat(X[0], "... -> batch ...", batch=timesteps),
+        einop(X[0], "... -> batch ...", batch=timesteps),
         np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
     )[0]
 
@@ -325,9 +281,9 @@ def main(
         plt.show()
 
     t_init = np.random.randint(0, timesteps, size=batch_size)
-    model = ConditionalModel(timesteps).init(42, (X[:batch_size], t_init))
+    model = Model(timesteps).init(42, (X[:batch_size], t_init))
     print(model.tabulate((X[:batch_size], t_init)))
-    optimizer = tx.Optimizer(
+    optimizer = ft.Optimizer(
         optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.adamw(3e-3),
@@ -372,6 +328,7 @@ def main(
                 # anim.save("sample.gif", writer="imagemagick")
 
     return locals()
+
 
 if __name__ == "__main__":
     typer.run(main)
