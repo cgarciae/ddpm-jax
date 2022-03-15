@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import PIL.Image
+import tensorflow as tf
 import typer
 from einop import einop
 from sklearn.datasets import make_swiss_roll
@@ -28,40 +29,23 @@ def to_uint8_image(x: np.ndarray) -> np.ndarray:
     return x
 
 
-def batch_data(ds: datasets.iterable_dataset.IterableDataset, batch_size: int):
-    batch = []
-    for sample in ds:
-        batch.append(sample)
-        if len(batch) % batch_size == 0 and len(batch) > 0:
-            yield {key: np.stack(x[key] for x in batch) for key in batch[0].keys()}
-            batch = []
+def get_data(batch_size: int, image_shape: tp.Tuple[int, int], channels: int):
 
+    hgds = datasets.load.load_dataset("cgarciae/cartoonset", split="train")
 
-def repeat_data(ds: datasets.iterable_dataset.IterableDataset):
-    i = 0
-    while True:
-        for sample in ds:
-            yield sample
-
-        i += 1
-        ds.set_epoch(i)
-
-
-def get_data(batch_size: int, image_shape: tp.Tuple[int, int]):
-
-    ds = datasets.load.load_dataset(
-        "cgarciae/cartoonset", streaming=True, split="train"
+    ds = tf.data.Dataset.from_generator(
+        lambda: hgds,
+        output_signature={
+            "img_bytes": tf.TensorSpec(shape=(), dtype=tf.string),
+        },
     )
 
     def process_fn(sample):
-        img: PIL.Image.Image = sample["img"]
+        x: tf.Tensor = tf.image.decode_png(sample["img_bytes"], channels=channels)
 
         # maybe resize the image
-        if img.size != image_shape:
-            img = img.resize(image_shape)
-
-        # convert to numpy array
-        x = np.asarray(img)
+        if x.shape != image_shape:
+            x = tf.image.resize(x, image_shape, antialias=True)
 
         # normalize -1 to 1
         x = x / 255.0
@@ -69,10 +53,12 @@ def get_data(batch_size: int, image_shape: tp.Tuple[int, int]):
 
         return {"img": x}
 
-    ds = ds.map(process_fn)
+    ds = ds.map(process_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.repeat()
     ds = ds.shuffle(seed=42, buffer_size=1_000)
-    ds = repeat_data(ds)
-    ds = batch_data(ds, batch_size)
+    ds = ds.batch(batch_size, drop_remainder=True)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    ds = ds.as_numpy_iterator()
 
     return ds
 
@@ -211,13 +197,14 @@ def main(
     schedule: str = "squared",
     tpu: bool = False,
     image_shape: tp.List[int] = (64, 64),
+    n_channels: int = 3,
 ):
     if tpu:
         from jax.tools import colab_tpu
 
         colab_tpu.setup_tpu()
 
-    ds = get_data(batch_size, image_shape)
+    ds = get_data(batch_size, image_shape, n_channels)
     ds = iter(ds)
 
     key = ft.Key(42)
@@ -228,7 +215,6 @@ def main(
     time_sample = np.random.randint(0, timesteps, size=batch_size)
     x_sample = next(ds)["img"]
 
-    n_channels = x_sample.shape[-1]
     model = ft.ModuleManager.new(UNet(dim=32, channels=n_channels)).init(
         42, x_sample, time_sample
     )

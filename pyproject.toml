@@ -16,6 +16,7 @@ einops = "<0.7.0"
 datasets = "^1.18.2"
 flax-tools = {path = "../flax-tools"}
 einop = "^0.0.1"
+tensorflow-cpu = "^2.8.0"
 
 [tool.poetry.dev-dependencies]
 black = {version = "^22.1.0", allow-prereleases = true}

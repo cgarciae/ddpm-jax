@@ -1,1 +1,1 @@
-pip install typer datasets einop
+pip install typer datasets einop flax optax tensorflow-cpu
