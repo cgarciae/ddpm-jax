@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import PIL.Image
 import typer
 from einop import einop
 from sklearn.datasets import make_swiss_roll
@@ -21,18 +22,59 @@ hdr_plot_style()
 Model = ft.ModuleManager[UNet]
 
 
-def get_data():
-
-    ds = datasets.load.load_dataset("mnist")
-    ds.set_format("numpy")
-    x = np.stack(ds["train"]["image"])[..., None]
-    x = x.astype(np.float32)
-
-    # normalize -1 to 1
-    x = x / 255.0
-    x = (x - 0.5) * 2.0
-
+def to_uint8_image(x: np.ndarray) -> np.ndarray:
+    x = (x / 2.0 + 0.5) * 255
+    x = np.clip(x, 0, 255).astype(np.uint8)
     return x
+
+
+def batch_data(ds: datasets.iterable_dataset.IterableDataset, batch_size: int):
+    batch = []
+    for sample in ds:
+        batch.append(sample)
+        if len(batch) % batch_size == 0 and len(batch) > 0:
+            yield {key: np.stack(x[key] for x in batch) for key in batch[0].keys()}
+            batch = []
+
+
+def repeat_data(ds: datasets.iterable_dataset.IterableDataset):
+    i = 0
+    while True:
+        for sample in ds:
+            yield sample
+
+        i += 1
+        ds.set_epoch(i)
+
+
+def get_data(batch_size: int, image_shape: tp.Tuple[int, int]):
+
+    ds = datasets.load.load_dataset(
+        "cgarciae/cartoonset", streaming=True, split="train"
+    )
+
+    def process_fn(sample):
+        img: PIL.Image.Image = sample["img"]
+
+        # maybe resize the image
+        if img.size != image_shape:
+            img = img.resize(image_shape)
+
+        # convert to numpy array
+        x = np.asarray(img)
+
+        # normalize -1 to 1
+        x = x / 255.0
+        x = (x - 0.5) * 2.0
+
+        return {"img": x}
+
+    ds = ds.map(process_fn)
+    ds = ds.shuffle(seed=42, buffer_size=1_000)
+    ds = repeat_data(ds)
+    ds = batch_data(ds, batch_size)
+
+    return ds
 
 
 def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2):
@@ -54,10 +96,11 @@ def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2
     return np.asarray(betas)
 
 
+@partial(jax.jit, device=jax.devices()[0])
 def noise_estimation_loss(
     params: tp.Optional[tp.Any],
     model: "Model",
-    sampler: GaussianDiffusion,
+    difussion_process: GaussianDiffusion,
     key: jnp.ndarray,
     x: jnp.ndarray,
     t: jnp.ndarray,
@@ -69,14 +112,11 @@ def noise_estimation_loss(
         model = model.update(params=params)
 
     # model input
-    xt, noise = sampler.forward_sample(key_sample, x, t)
+    xt, noise = difussion_process.forward_sample(key_sample, x, t)
 
     preds, model = model(key_model, xt, t)
 
     return jnp.mean((noise - preds) ** 2)
-
-
-noise_estimation_loss_jit = jax.jit(noise_estimation_loss)
 
 
 def plot_trajectory(
@@ -104,21 +144,23 @@ def plot_trajectory(
         axs[plot_i].set_title("$q(\mathbf{x}_{" + str(t) + "})$")
 
 
-@jax.jit
+@partial(jax.jit, device=jax.devices()[0])
 def train_step(
     key: jnp.ndarray,
     model: Model,
     optimizer: ft.Optimizer,
-    sampler: GaussianDiffusion,
+    difussion_process: GaussianDiffusion,
     ema: EMA,
     x: jnp.ndarray,
     t: jnp.ndarray,
 ):
+    print("JITTING")
     params = model["params"]
-    grads = jax.grad(noise_estimation_loss)(params, model, sampler, key, x, t)
-    model, optimizer = optimizer.update(grads, model)
-    model, ema = ema.update(model)
-    return model, optimizer, sampler, ema
+    grads = jax.grad(noise_estimation_loss)(params, model, difussion_process, key, x, t)
+    params, optimizer = optimizer.update(grads, params)
+    params, ema = ema.update(params)
+    model = model.update(params=params)
+    return model, optimizer, difussion_process, ema
 
 
 @jax.jit
@@ -138,20 +180,22 @@ def plot_data(
     X: np.ndarray,
     timesteps: int,
     beta: np.ndarray,
-    sampler: GaussianDiffusion,
+    difussion_process: GaussianDiffusion,
 ):
-    x_seq = sampler.forward_sample(
+    x_seq = difussion_process.forward_sample(
         key,
         einop(X[0], "... -> batch ...", batch=timesteps),
         np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
     )[0]
+    x_seq = to_uint8_image(x_seq)
 
     plot_trajectory(x_seq, n_plots=5, max_timestep=timesteps)
 
     # plot 8 random mnist images using subplots
     fig, ax = plt.subplots(2, 4, figsize=(12, 6))
     for i in range(8):
-        ax[i // 4, i % 4].imshow(X[i].squeeze(), cmap="gray")
+        xi = to_uint8_image(X[i])
+        ax[i // 4, i % 4].imshow(xi.squeeze(), cmap="gray")
         ax[i // 4, i % 4].set_axis_off()
 
     plt.figure(figsize=(16, 12))
@@ -161,30 +205,31 @@ def plot_data(
 def main(
     steps: int = 100_000,
     timesteps: int = 1_000,
-    batch_size: int = 128,
-    n_samples: int = 8_000,
+    batch_size: int = 32,
     viz: bool = True,
     plot_steps: int = 10_000,
     schedule: str = "squared",
     tpu: bool = False,
-    image_shape: tp.List[int] = (32, 32),
+    image_shape: tp.List[int] = (64, 64),
 ):
     if tpu:
         from jax.tools import colab_tpu
 
         colab_tpu.setup_tpu()
 
-    X = get_data()
-    X = np.asarray(Resize(image_shape)(X))
+    ds = get_data(batch_size, image_shape)
+    ds = iter(ds)
+
     key = ft.Key(42)
     beta = make_beta_schedule(
         schedule=schedule, n_timesteps=timesteps, start=1e-5, end=1e-2
     )
 
     time_sample = np.random.randint(0, timesteps, size=batch_size)
-    x_sample = X[:batch_size]
+    x_sample = next(ds)["img"]
 
-    model = ft.ModuleManager.new(UNet(dim=32, channels=1)).init(
+    n_channels = x_sample.shape[-1]
+    model = ft.ModuleManager.new(UNet(dim=32, channels=n_channels)).init(
         42, x_sample, time_sample
     )
     optimizer = ft.Optimizer(
@@ -193,29 +238,41 @@ def main(
             optax.adamw(3e-3),
         )
     ).init(model["params"])
-    sampler = GaussianDiffusion.new(beta)
+    difussion_process = GaussianDiffusion.new(beta)
     ema = EMA(model["params"], mu=0.9)
 
     if viz:
-        plot_data(key=key, X=X, timesteps=timesteps, beta=beta, sampler=sampler)
+        plot_data(
+            key=key,
+            X=x_sample,
+            timesteps=timesteps,
+            beta=beta,
+            difussion_process=difussion_process,
+        )
         plt.show()
 
-    for i in tqdm(range(steps + 1)):
-        batch_idxs = np.random.choice(len(X), size=batch_size, replace=False)
-        x_batch = X[batch_idxs]
-        t = np.random.randint(0, timesteps, size=batch_size)
+    for i, batch in tqdm(zip(range(steps + 1), ds), total=steps + 1):
+        x_batch = batch["img"]
+        t_batch = np.random.randint(0, timesteps, size=batch_size)
 
         key, key_step = jax.random.split(key)
-        model, optimizer, sampler, ema = train_step(
-            key_step, model, optimizer, sampler, ema, x_batch, t
+        model, optimizer, difussion_process, ema = train_step(
+            key_step, model, optimizer, difussion_process, ema, x_batch, t_batch
         )
 
         if i % plot_steps == 0:
             # print loss
-            print(noise_estimation_loss_jit(model, sampler, x_batch, t))
+            print(
+                noise_estimation_loss(
+                    None, model, difussion_process, key, x_batch, t_batch
+                )
+            )
 
             if viz:
-                x_seq = sampler.reverse_sample_loop(model, (1, 28, 28, 1))
+                x_seq = difussion_process.reverse_sample_loop(
+                    key, model, (1, *image_shape, n_channels)
+                )
+                x_seq = to_uint8_image(x_seq)
                 print("Plotting...")
 
                 # print(x_seq[-1])

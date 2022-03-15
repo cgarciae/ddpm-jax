@@ -1,15 +1,9 @@
 import jax
 import jax.numpy as jnp
-
-x = 1.0
-t = 0.5
+import numpy as np
 
 
-@jax.jit
-def f(x, t):
-    return jax.lax.cond(t > 0, lambda: x, lambda: -x)
-
-
-y = f(x, t)
+x = np.array([-1, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 258.0])
+y = x.astype(np.uint8)
 
 print(y)

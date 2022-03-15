@@ -1,1 +1,1 @@
-pip install typer treex einops datasets
+pip install typer datasets einop

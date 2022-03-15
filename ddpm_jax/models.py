@@ -12,6 +12,7 @@ import numpy as np
 from einop import einop
 
 A = tp.TypeVar("A")
+M = tp.TypeVar("M", bound="nn.Module")
 ArrayFn = tp.Callable[[jnp.ndarray], jnp.ndarray]
 
 
@@ -325,7 +326,7 @@ class GaussianDiffusion(ft.Immutable):
     def reverse_sample(
         self,
         key: jnp.ndarray,
-        model: ft.ModuleManager[nn.Module],
+        model: ft.ModuleManager[M],
         x: jnp.ndarray,
         t: jnp.ndarray,
     ) -> jnp.ndarray:
@@ -350,7 +351,7 @@ class GaussianDiffusion(ft.Immutable):
     def reverse_sample_vmap(
         self,
         key: jnp.ndarray,
-        model: ft.ModuleManager[nn.Module],
+        model: ft.ModuleManager[M],
         x: jnp.ndarray,
         t: jnp.ndarray,
     ) -> jnp.ndarray:
@@ -388,11 +389,11 @@ class GaussianDiffusion(ft.Immutable):
         key = jax.random.split(key, len(x))
         return jax.vmap(_sample_fn)(key, noise_pred, x, t)
 
-    @partial(jax.jit, static_argnums=(2, 3))
+    @partial(jax.jit, static_argnums=(3,), device=jax.devices()[0])
     def reverse_sample_loop(
         self,
         key: jnp.ndarray,
-        model: ft.ModuleManager[nn.Module],
+        model: ft.ModuleManager[M],
         sample_shape: tp.Tuple[int, ...],
     ) -> jnp.ndarray:
         def scan_fn(x: jnp.ndarray, keys_ts: tp.Tuple[jnp.ndarray, jnp.ndarray]):
