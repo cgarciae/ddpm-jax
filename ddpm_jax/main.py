@@ -16,7 +16,8 @@ from sklearn.datasets import make_swiss_roll
 from tqdm import tqdm
 
 from ddpm_jax.helper_plot import hdr_plot_style, make_animation, plot_gradients
-from ddpm_jax.models import EMA, GaussianDiffusion, Resize, UNet
+from ddpm_jax.models import EMA, ArrayFn, GaussianDiffusion, Resize, UNet
+from flax_tools.utils import static
 
 hdr_plot_style()
 
@@ -29,19 +30,52 @@ def to_uint8_image(x: np.ndarray) -> np.ndarray:
     return x
 
 
-def get_data(batch_size: int, image_shape: tp.Tuple[int, int], channels: int):
+def get_data(
+    dataset_params: tp.Tuple[str, ...],
+    dataset_type: str,
+    batch_size: int,
+    image_shape: tp.Tuple[int, int],
+    channels: int,
+):
+    assert dataset_type in {"image", "bytes"}
 
-    hgds = datasets.load.load_dataset("cgarciae/cartoonset", split="train")
+    hgds = datasets.load.load_dataset(*dataset_params, split="train")
 
-    ds = tf.data.Dataset.from_generator(
-        lambda: hgds,
-        output_signature={
-            "img_bytes": tf.TensorSpec(shape=(), dtype=tf.string),
-        },
-    )
+    img_key = [key for key in hgds.features.keys() if key.startswith("im")][0]
+
+    if dataset_type == "image":
+        remove_columns = [key for key in hgds.features.keys() if key != "img"]
+
+        def map_fn(sample):
+            img = np.asarray(sample[img_key])
+
+            if len(img.shape) == 2:
+                img = img[..., None]
+
+            return {"img": img}
+
+        hgds = hgds.map(map_fn, remove_columns=remove_columns)
+        ds = tf.data.Dataset.from_generator(
+            lambda: hgds,
+            output_signature={
+                "img": tf.TensorSpec(shape=(None, None, channels), dtype=tf.uint8),
+            },
+        )
+    else:
+        ds = tf.data.Dataset.from_generator(
+            lambda: hgds,
+            output_signature={
+                "img_bytes": tf.TensorSpec(shape=(), dtype=tf.string),
+            },
+        )
 
     def process_fn(sample):
-        x: tf.Tensor = tf.image.decode_png(sample["img_bytes"], channels=channels)
+        x: tf.Tensor
+
+        if dataset_type == "image":
+            x = sample["img"]
+        else:
+            x = tf.image.decode_png(sample["img_bytes"], channels=channels)
 
         # maybe resize the image
         if x.shape != image_shape:
@@ -82,17 +116,25 @@ def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2
     return np.asarray(betas)
 
 
-@partial(jax.jit, device=jax.devices()[0])
+LOSS_FN: tp.Dict[str, ArrayFn] = {
+    "l1": jnp.abs,
+    "l2": jnp.square,
+}
+
+
+@partial(jax.jit, static_argnums=(4,), device=jax.devices()[0])
 def noise_estimation_loss(
     params: tp.Optional[tp.Any],
     model: "Model",
     difussion_process: GaussianDiffusion,
     key: jnp.ndarray,
+    loss_type: str,
     x: jnp.ndarray,
     t: jnp.ndarray,
 ):
     preds: jnp.ndarray
     key_sample, key_model = jax.random.split(key, 2)
+    loss_fn = LOSS_FN[loss_type]
 
     if params is not None:
         model = model.update(params=params)
@@ -102,7 +144,7 @@ def noise_estimation_loss(
 
     preds, model = model(key_model, xt, t)
 
-    return jnp.mean((noise - preds) ** 2)
+    return jnp.mean(loss_fn(noise - preds))
 
 
 def plot_trajectory(
@@ -130,35 +172,26 @@ def plot_trajectory(
         axs[plot_i].set_title("$q(\mathbf{x}_{" + str(t) + "})$")
 
 
-@partial(jax.jit, device=jax.devices()[0])
+@partial(jax.jit, static_argnums=(5,), device=jax.devices()[0])
 def train_step(
     key: jnp.ndarray,
     model: Model,
     optimizer: ft.Optimizer,
     difussion_process: GaussianDiffusion,
     ema: EMA,
+    loss_type: str,
     x: jnp.ndarray,
     t: jnp.ndarray,
 ):
     print("JITTING")
     params = model["params"]
-    grads = jax.grad(noise_estimation_loss)(params, model, difussion_process, key, x, t)
+    grads = jax.grad(noise_estimation_loss)(
+        params, model, difussion_process, key, loss_type, x, t
+    )
     params, optimizer = optimizer.update(grads, params)
     params, ema = ema.update(params)
     model = model.update(params=params)
     return model, optimizer, difussion_process, ema
-
-
-@jax.jit
-def get_gradient(model: Model, x: jnp.ndarray):
-    ts = jnp.arange(model.timesteps // 4, dtype=jnp.int32)
-
-    @jax.vmap
-    def f(t):
-        t = jnp.zeros(x.shape[0], dtype=jnp.int32) + t
-        return -model(x, t)
-
-    return f(ts).mean(axis=0)
 
 
 def plot_data(
@@ -198,13 +231,21 @@ def main(
     tpu: bool = False,
     image_shape: tp.List[int] = (64, 64),
     n_channels: int = 3,
+    dataset_params: tp.List[str] = ("cgarciae/cartoonset", "10k"),
+    dataset_type: str = "bytes",
+    dims: int = 32,
+    ema_decay: float = 0.9,
+    train_lr: float = 3e-3,
+    loss_type: str = "l1",
+    use_gradient_clipping: bool = True,
+    dim_mults: tp.Tuple[int, ...] = (1, 2, 4, 8),
 ):
     if tpu:
         from jax.tools import colab_tpu
 
         colab_tpu.setup_tpu()
 
-    ds = get_data(batch_size, image_shape, n_channels)
+    ds = get_data(dataset_params, dataset_type, batch_size, image_shape, n_channels)
     ds = iter(ds)
 
     key = ft.Key(42)
@@ -215,17 +256,20 @@ def main(
     time_sample = np.random.randint(0, timesteps, size=batch_size)
     x_sample = next(ds)["img"]
 
-    model = ft.ModuleManager.new(UNet(dim=32, channels=n_channels)).init(
-        42, x_sample, time_sample
-    )
+    model = ft.ModuleManager.new(
+        UNet(dim=dims, dim_mults=dim_mults, channels=n_channels)
+    ).init(42, x_sample, time_sample)
+
+    optimizers = [optax.clip_by_global_norm(1.0)] if use_gradient_clipping else []
+
     optimizer = ft.Optimizer(
         optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(3e-3),
+            *optimizers,
+            optax.adamw(train_lr),
         )
     ).init(model["params"])
     difussion_process = GaussianDiffusion.new(beta)
-    ema = EMA(model["params"], mu=0.9)
+    ema = EMA(model["params"], mu=ema_decay)
 
     if viz:
         plot_data(
@@ -243,14 +287,21 @@ def main(
 
         key, key_step = jax.random.split(key)
         model, optimizer, difussion_process, ema = train_step(
-            key_step, model, optimizer, difussion_process, ema, x_batch, t_batch
+            key_step,
+            model,
+            optimizer,
+            difussion_process,
+            ema,
+            loss_type,
+            x_batch,
+            t_batch,
         )
 
         if i % plot_steps == 0:
             # print loss
             print(
                 noise_estimation_loss(
-                    None, model, difussion_process, key, x_batch, t_batch
+                    None, model, difussion_process, key, loss_type, x_batch, t_batch
                 )
             )
 
@@ -261,24 +312,9 @@ def main(
                 x_seq = to_uint8_image(x_seq)
                 print("Plotting...")
 
-                # print(x_seq[-1])
-
                 plot_trajectory(x_seq[::-1][:, 0], n_plots=7, reverse=True)
 
-                # anim = make_animation(
-                #     x_seq,
-                #     model=model,
-                #     data=X,
-                #     forward=get_gradient,
-                #     step_size=1,
-                #     interval=10,
-                #     xlim_scale=0.7,
-                #     ylim_scale=0.7,
-                # )
-
                 plt.show()
-
-                # anim.save("sample.gif", writer="imagemagick")
 
     return locals()
 
