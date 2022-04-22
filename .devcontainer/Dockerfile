@@ -6,6 +6,7 @@ RUN apt-get install -y git
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Europe/London
 RUN apt-get install -y python3-tk
+RUN apt install python-is-python3
 
 ###############################################################################
 

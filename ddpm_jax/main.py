@@ -1,27 +1,33 @@
 import typing as tp
 from functools import partial
+from pickletools import optimize
 
 import datasets
-import flax_tools as ft
 import jax
 import jax.numpy as jnp
+import jax_metrics as jm
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-import PIL.Image
 import tensorflow as tf
+import treex as tx
 import typer
 from einop import einop
-from sklearn.datasets import make_swiss_roll
+from elegy.model.model_full import Model as Trainer
+from elegy.modules.core_module import CoreModule
+from elegy.modules.flax_module import ModuleState
 from tqdm import tqdm
 
 from ddpm_jax.helper_plot import hdr_plot_style, make_animation, plot_gradients
 from ddpm_jax.models import EMA, ArrayFn, GaussianDiffusion, Resize, UNet
-from flax_tools.utils import static
 
 hdr_plot_style()
 
-Model = ft.ModuleManager[UNet]
+DEVICE_0 = jax.devices()[0]
+
+Model = ModuleState[UNet]
+DM = tp.TypeVar("DM", bound="DiffusionModel")
+Logs = tp.Dict[str, jnp.ndarray]
 
 
 def to_uint8_image(x: np.ndarray) -> np.ndarray:
@@ -36,15 +42,16 @@ def get_data(
     batch_size: int,
     image_shape: tp.Tuple[int, int],
     channels: int,
+    timesteps: int,
 ):
     assert dataset_type in {"image", "bytes"}
 
-    hgds = datasets.load.load_dataset(*dataset_params, split="train")
+    hfds = datasets.load.load_dataset(*dataset_params, split="train", cache_dir="data")
 
-    img_key = [key for key in hgds.features.keys() if key.startswith("im")][0]
+    img_key = [key for key in hfds.features.keys() if key.startswith("im")][0]
 
     if dataset_type == "image":
-        remove_columns = [key for key in hgds.features.keys() if key != "img"]
+        remove_columns = [key for key in hfds.features.keys() if key != "img"]
 
         def map_fn(sample):
             img = np.asarray(sample[img_key])
@@ -54,16 +61,16 @@ def get_data(
 
             return {"img": img}
 
-        hgds = hgds.map(map_fn, remove_columns=remove_columns)
+        hfds = hfds.map(map_fn, remove_columns=remove_columns)
         ds = tf.data.Dataset.from_generator(
-            lambda: hgds,
+            lambda: hfds,
             output_signature={
                 "img": tf.TensorSpec(shape=(None, None, channels), dtype=tf.uint8),
             },
         )
     else:
         ds = tf.data.Dataset.from_generator(
-            lambda: hgds,
+            lambda: hfds,
             output_signature={
                 "img_bytes": tf.TensorSpec(shape=(), dtype=tf.string),
             },
@@ -77,15 +84,16 @@ def get_data(
         else:
             x = tf.image.decode_png(sample["img_bytes"], channels=channels)
 
-        # maybe resize the image
-        if x.shape != image_shape:
-            x = tf.image.resize(x, image_shape, antialias=True)
+        # resize the image
+        x = tf.image.resize(x, image_shape, antialias=True)
 
         # normalize -1 to 1
         x = x / 255.0
         x = (x - 0.5) * 2.0
 
-        return {"img": x}
+        t = tf.random.uniform(shape=(), minval=0, maxval=timesteps, dtype=tf.int32)
+
+        return x, t
 
     ds = ds.map(process_fn, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.repeat()
@@ -116,37 +124,6 @@ def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2
     return np.asarray(betas)
 
 
-LOSS_FN: tp.Dict[str, ArrayFn] = {
-    "l1": jnp.abs,
-    "l2": jnp.square,
-}
-
-
-@partial(jax.jit, static_argnums=(4,), device=jax.devices()[0])
-def noise_estimation_loss(
-    params: tp.Optional[tp.Any],
-    model: "Model",
-    difussion_process: GaussianDiffusion,
-    key: jnp.ndarray,
-    loss_type: str,
-    x: jnp.ndarray,
-    t: jnp.ndarray,
-):
-    preds: jnp.ndarray
-    key_sample, key_model = jax.random.split(key, 2)
-    loss_fn = LOSS_FN[loss_type]
-
-    if params is not None:
-        model = model.update(params=params)
-
-    # model input
-    xt, noise = difussion_process.forward_sample(key_sample, x, t)
-
-    preds, model = model(key_model, xt, t)
-
-    return jnp.mean(loss_fn(noise - preds))
-
-
 def plot_trajectory(
     x_seq: np.ndarray,
     n_plots: int = 10,
@@ -172,36 +149,14 @@ def plot_trajectory(
         axs[plot_i].set_title("$q(\mathbf{x}_{" + str(t) + "})$")
 
 
-@partial(jax.jit, static_argnums=(5,), device=jax.devices()[0])
-def train_step(
-    key: jnp.ndarray,
-    model: Model,
-    optimizer: ft.Optimizer,
-    difussion_process: GaussianDiffusion,
-    ema: EMA,
-    loss_type: str,
-    x: jnp.ndarray,
-    t: jnp.ndarray,
-):
-    print("JITTING")
-    params = model["params"]
-    grads = jax.grad(noise_estimation_loss)(
-        params, model, difussion_process, key, loss_type, x, t
-    )
-    params, optimizer = optimizer.update(grads, params)
-    params, ema = ema.update(params)
-    model = model.update(params=params)
-    return model, optimizer, difussion_process, ema
-
-
 def plot_data(
     key: jnp.ndarray,
     X: np.ndarray,
     timesteps: int,
     beta: np.ndarray,
-    difussion_process: GaussianDiffusion,
+    diffusion: GaussianDiffusion,
 ):
-    x_seq = difussion_process.forward_sample(
+    x_seq = diffusion.forward_sample(
         key,
         einop(X[0], "... -> batch ...", batch=timesteps),
         np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
@@ -221,12 +176,172 @@ def plot_data(
     plt.scatter(np.arange(timesteps), beta)
 
 
+class DiffusionModel(CoreModule):
+    # static
+    image_shape: tp.Tuple[int, ...]
+    n_channels: int
+    timesteps: int
+    viz: bool
+
+    # nodes
+    key: tp.Optional[jnp.ndarray] = tx.node()
+    model: Model = tx.node()
+    optimizer: tx.Optimizer = tx.node()
+    diffusion: GaussianDiffusion = tx.node()
+    metrics: jm.LossesAndMetrics = tx.node()
+    ema: EMA = tx.node()
+
+    def __init__(
+        self,
+        *,
+        beta: np.ndarray,
+        timesteps: int = 1000,
+        dims: int = 32,
+        dim_mults: tp.Sequence[int] = (1, 2, 4, 8),
+        image_shape: tp.Sequence[int] = (64, 64),
+        use_gradient_clipping: bool = True,
+        loss_type: str = "mse",
+        train_lr: float = 3e-3,
+        n_channels: int = 3,
+        ema_decay: float = 0.9,
+        viz: bool = False,
+    ):
+        self.key = None
+        self.model = Model(
+            UNet(
+                dim=dims,
+                dim_mults=tuple(dim_mults),
+                channels=n_channels,
+            )
+        )
+        self.optimizer = tx.Optimizer(
+            optax.chain(
+                *([optax.clip_by_global_norm(1.0)] if use_gradient_clipping else []),
+                optax.adamw(train_lr),
+            )
+        )
+        self.diffusion = GaussianDiffusion(beta)
+        self.metrics = jm.LossesAndMetrics(
+            losses=jm.losses.MeanSquaredError()
+            if loss_type == "mse"
+            else jm.losses.MeanAbsoluteError()
+        )
+        self.ema = EMA(ema_decay)
+
+        self.image_shape = tuple(image_shape)
+        self.n_channels = n_channels
+        self.timesteps = timesteps
+        self.viz = viz
+
+    # @partial(jax.jit, device=DEVICE_0)
+    @tx.toplevel_mutable
+    def init_step(
+        self, key: jnp.ndarray, batch: tp.Tuple[jnp.ndarray, jnp.ndarray]
+    ) -> "DiffusionModel":
+        print("INIT_STEP")
+        x, t = batch
+
+        if self.viz:
+            plot_data(
+                key,
+                x,
+                self.timesteps,
+                self.diffusion.beta,
+                self.diffusion,
+            )
+            plt.show()
+
+        model_key, self.key = jax.random.split(key)
+        self.model = self.model.init(model_key, x, t)
+        self.optimizer = self.optimizer.init(self.model["params"])
+        self.ema = self.ema.init(self.model["params"])
+        return self
+
+    @partial(jax.jit, device=DEVICE_0)
+    @tx.toplevel_mutable
+    def reset_step(self: "DiffusionModel") -> "DiffusionModel":
+        self.metrics = self.metrics.reset()
+        return self
+
+    @partial(jax.jit, device=DEVICE_0)
+    @tx.toplevel_mutable
+    def noise_estimation_loss(
+        self: "DiffusionModel",
+        params: tp.Optional[tp.Any],
+        key: jnp.ndarray,
+        x: jnp.ndarray,
+        t: jnp.ndarray,
+    ) -> tp.Tuple[jnp.ndarray, "DiffusionModel"]:
+        noise_pred: jnp.ndarray
+        key_sample, key_model = jax.random.split(key, 2)
+
+        if params is not None:
+            self.model = self.model.update(params=params)
+
+        # model input
+        xt, noise = self.diffusion.forward_sample(key_sample, x, t)
+
+        noise_pred, self.model = self.model.apply(key_model, xt, t)
+
+        loss, self.metrics = self.metrics.loss_and_update(
+            preds=noise_pred, target=noise
+        )
+
+        return loss, self
+
+    @partial(jax.jit, device=DEVICE_0)
+    @tx.toplevel_mutable
+    def train_step(
+        self: "DiffusionModel",
+        batch: tp.Tuple[jnp.ndarray, jnp.ndarray],
+        batch_idx: int,
+        epoch_idx: int,
+    ) -> tp.Tuple[Logs, "DiffusionModel"]:
+        print("TRAIN_STEP")
+        x, t = batch
+
+        assert self.key is not None
+
+        params = self.model["params"]
+        loss_key, self.key = jax.random.split(self.key)
+
+        grads, self = jax.grad(self.noise_estimation_loss, has_aux=True)(
+            params, loss_key, x, t
+        )
+
+        params, self.optimizer = self.optimizer.update(grads, params)
+        params, self.ema = self.ema.update(params)
+        self.model = self.model.update(params=params)
+
+        logs = self.metrics.compute_logs()
+
+        return logs, self
+
+    def on_epoch_end(self: DM, epoch: int, logs: tp.Optional[Logs] = None) -> DM:
+
+        if self.viz:
+            assert self.key is not None
+
+            print("Generating Sample...")
+            x_seq = self.diffusion.reverse_sample_loop(
+                self.key, self.model, (1, *self.image_shape, self.n_channels)
+            )
+            x_seq = to_uint8_image(x_seq)
+            print("Plotting...")
+
+            plot_trajectory(x_seq[::-1][:, 0], n_plots=7, reverse=True)
+
+            plt.show()
+
+        return self
+
+
 def main(
-    steps: int = 100_000,
+    step_per_epoch: int = 500,
+    total_steps: int = 100_000,
     timesteps: int = 1_000,
     batch_size: int = 32,
     viz: bool = True,
-    plot_steps: int = 10_000,
     schedule: str = "squared",
     tpu: bool = False,
     image_shape: tp.List[int] = (64, 64),
@@ -236,85 +351,52 @@ def main(
     dims: int = 32,
     ema_decay: float = 0.9,
     train_lr: float = 3e-3,
-    loss_type: str = "l1",
+    loss_type: str = "mse",
     use_gradient_clipping: bool = True,
-    dim_mults: tp.Tuple[int, ...] = (1, 2, 4, 8),
+    dim_mults: tp.List[int] = (1, 2, 4, 8),
 ):
+    epochs = total_steps // step_per_epoch
+
     if tpu:
         from jax.tools import colab_tpu
 
         colab_tpu.setup_tpu()
 
-    ds = get_data(dataset_params, dataset_type, batch_size, image_shape, n_channels)
-    ds = iter(ds)
+    ds = get_data(
+        dataset_params=tuple(dataset_params),
+        dataset_type=dataset_type,
+        batch_size=batch_size,
+        image_shape=tuple(image_shape),
+        channels=n_channels,
+        timesteps=timesteps,
+    )
 
-    key = ft.Key(42)
     beta = make_beta_schedule(
         schedule=schedule, n_timesteps=timesteps, start=1e-5, end=1e-2
     )
 
-    time_sample = np.random.randint(0, timesteps, size=batch_size)
-    x_sample = next(ds)["img"]
+    module = DiffusionModel(
+        beta=beta,
+        timesteps=timesteps,
+        dims=dims,
+        dim_mults=dim_mults,
+        image_shape=tuple(image_shape),
+        use_gradient_clipping=use_gradient_clipping,
+        loss_type=loss_type,
+        train_lr=train_lr,
+        n_channels=n_channels,
+        ema_decay=ema_decay,
+        viz=viz,
+    )
 
-    model = ft.ModuleManager.new(
-        UNet(dim=dims, dim_mults=dim_mults, channels=n_channels)
-    ).init(42, x_sample, time_sample)
+    trainer = Trainer(module)
 
-    optimizers = [optax.clip_by_global_norm(1.0)] if use_gradient_clipping else []
-
-    optimizer = ft.Optimizer(
-        optax.chain(
-            *optimizers,
-            optax.adamw(train_lr),
-        )
-    ).init(model["params"])
-    difussion_process = GaussianDiffusion.new(beta)
-    ema = EMA(model["params"], mu=ema_decay)
-
-    if viz:
-        plot_data(
-            key=key,
-            X=x_sample,
-            timesteps=timesteps,
-            beta=beta,
-            difussion_process=difussion_process,
-        )
-        plt.show()
-
-    for i, batch in tqdm(zip(range(steps + 1), ds), total=steps + 1):
-        x_batch = batch["img"]
-        t_batch = np.random.randint(0, timesteps, size=batch_size)
-
-        key, key_step = jax.random.split(key)
-        model, optimizer, difussion_process, ema = train_step(
-            key_step,
-            model,
-            optimizer,
-            difussion_process,
-            ema,
-            loss_type,
-            x_batch,
-            t_batch,
-        )
-
-        if i % plot_steps == 0:
-            # print loss
-            print(
-                noise_estimation_loss(
-                    None, model, difussion_process, key, loss_type, x_batch, t_batch
-                )
-            )
-
-            if viz:
-                x_seq = difussion_process.reverse_sample_loop(
-                    key, model, (1, *image_shape, n_channels)
-                )
-                x_seq = to_uint8_image(x_seq)
-                print("Plotting...")
-
-                plot_trajectory(x_seq[::-1][:, 0], n_plots=7, reverse=True)
-
-                plt.show()
+    trainer.fit(
+        ds,
+        epochs=epochs,
+        batch_size=batch_size,
+        steps_per_epoch=step_per_epoch,
+    )
 
     return locals()
 

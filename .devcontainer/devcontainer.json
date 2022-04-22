@@ -4,7 +4,11 @@
     },
     "runArgs": [
         "--privileged",
-        "--volume=/tmp/.X11-unix:/tmp/.X11-unix"
+        "--volume=/tmp/.X11-unix:/tmp/.X11-unix",
+        "--volume=/data/cristian/elegy:/workspaces/elegy",
+        "--volume=/data/cristian/treex:/workspaces/treex",
+        "--volume=/data/cristian/treeo:/workspaces/treeo",
+        "--volume=/data/cristian/jax-metrics:/workspaces/jax-metrics",
     ],
     "postCreateCommand": [
         "bash",

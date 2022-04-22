@@ -1,15 +1,15 @@
 import dataclasses
+import typing as tp
 from functools import partial
 from inspect import isfunction
-import typing as tp
-from chex import dataclass
 
 import flax.linen as nn
-import flax_tools as ft
 import jax
 import jax.numpy as jnp
 import numpy as np
+import treeo as to
 from einop import einop
+from elegy.modules.flax_module import ModuleState
 
 A = tp.TypeVar("A")
 M = tp.TypeVar("M", bound="nn.Module")
@@ -24,20 +24,6 @@ def default(val, d):
 
 def conv_padding(*args: int) -> tp.List[tp.Tuple[int, int]]:
     return [(p, p) for p in args]
-
-
-@ft.dataclass
-class EMA(tp.Generic[A], ft.Immutable):
-    params: A = ft.field()
-    mu: float = ft.static(0.999)
-
-    def update(self, new_params: A) -> tp.Tuple[A, "EMA"]:
-        params = jax.tree_map(self._ema, self.params, new_params)
-        ema = self.replace(params=params)
-        return params, ema
-
-    def _ema(self, params, new_params):
-        return self.mu * params + (1.0 - self.mu) * new_params
 
 
 @dataclasses.dataclass
@@ -201,6 +187,26 @@ def Resize(
 
 
 @dataclasses.dataclass
+class EMA(tp.Generic[A], to.Tree, to.Immutable):
+    mu: float = to.static(0.999)
+    params: tp.Optional[A] = to.node(None)
+
+    def init(self, params: A) -> "EMA":
+        return self.replace(params=params)
+
+    def update(self, new_params: A) -> tp.Tuple[A, "EMA"]:
+        if self.params is None:
+            raise ValueError("params must be initialized")
+
+        params = jax.tree_map(self._ema, self.params, new_params)
+        ema = self.replace(params=params)
+        return params, ema
+
+    def _ema(self, params, new_params):
+        return self.mu * params + (1.0 - self.mu) * new_params
+
+
+@dataclasses.dataclass
 class UNet(nn.Module):
     dim: int
     out_dim: tp.Optional[int] = None
@@ -295,19 +301,15 @@ class UNet(nn.Module):
         return self.final_conv(x)
 
 
-@ft.dataclass
-class GaussianDiffusion(ft.Immutable):
-    beta: jnp.ndarray = ft.node()
-    alpha: jnp.ndarray = ft.node()
-    alpha_prod: jnp.ndarray = ft.node()
+class GaussianDiffusion(to.Tree, to.Immutable):
+    beta: jnp.ndarray = to.node()
+    alpha: jnp.ndarray = to.node()
+    alpha_prod: jnp.ndarray = to.node()
 
-    @classmethod
-    def new(cls, beta: np.ndarray) -> "GaussianDiffusion":
-        beta = jnp.asarray(beta)
-        alphas = 1.0 - beta
-        alpha_prod = jnp.cumprod(alphas)
-
-        return cls(beta, alphas, alpha_prod)
+    def __init__(self, beta: np.ndarray):
+        self.beta = jnp.asarray(beta)
+        self.alpha = 1.0 - self.beta
+        self.alpha_prod = jnp.cumprod(self.alpha)
 
     def forward_sample(
         self, key: jnp.ndarray, x: jnp.ndarray, t: jnp.ndarray
@@ -326,12 +328,12 @@ class GaussianDiffusion(ft.Immutable):
     def reverse_sample(
         self,
         key: jnp.ndarray,
-        model: ft.ModuleManager[M],
+        model: ModuleState[M],
         x: jnp.ndarray,
         t: jnp.ndarray,
     ) -> jnp.ndarray:
 
-        noise_pred = model(None, x, t)[0]
+        noise_pred = model.apply(None, x, t)[0]
 
         beta_t: jnp.ndarray = self.beta[t][:, None, None, None]
         alpha_t: jnp.ndarray = self.alpha[t][:, None, None, None]
@@ -351,7 +353,7 @@ class GaussianDiffusion(ft.Immutable):
     def reverse_sample_vmap(
         self,
         key: jnp.ndarray,
-        model: ft.ModuleManager[M],
+        model: ModuleState[M],
         x: jnp.ndarray,
         t: jnp.ndarray,
     ) -> jnp.ndarray:
@@ -385,7 +387,7 @@ class GaussianDiffusion(ft.Immutable):
 
             return x_next
 
-        noise_pred = model(None, x, t)[0]
+        noise_pred = model.apply(None, x, t)[0]
         key = jax.random.split(key, len(x))
         return jax.vmap(_sample_fn)(key, noise_pred, x, t)
 
@@ -393,7 +395,7 @@ class GaussianDiffusion(ft.Immutable):
     def reverse_sample_loop(
         self,
         key: jnp.ndarray,
-        model: ft.ModuleManager[M],
+        model: ModuleState[M],
         sample_shape: tp.Tuple[int, ...],
     ) -> jnp.ndarray:
         def scan_fn(x: jnp.ndarray, keys_ts: tp.Tuple[jnp.ndarray, jnp.ndarray]):
