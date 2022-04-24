@@ -1,9 +1,13 @@
-import jax
-import jax.numpy as jnp
-import numpy as np
+import ddpm_jax.main
+import importlib
 
+importlib.reload(ddpm_jax.main)
 
-x = np.array([-1, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 258.0])
-y = x.astype(np.uint8)
+main_locals = ddpm_jax.main.main(
+    steps_per_epoch=500,
+    dataset_params=("cgarciae/cartoonset", "100k"),
+    image_shape=(64, 64),
+    dims=64,
+)
 
-print(y)
+locals().update(main_locals)

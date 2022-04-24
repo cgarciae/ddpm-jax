@@ -1,4 +1,6 @@
+import enum
 import typing as tp
+from base64 import b64encode
 from functools import partial
 from pickletools import optimize
 
@@ -12,10 +14,12 @@ import optax
 import tensorflow as tf
 import treex as tx
 import typer
+import wandb
 from einop import einop
 from elegy.model.model_full import Model as Trainer
 from elegy.modules.core_module import CoreModule
 from elegy.modules.flax_module import ModuleState
+from matplotlib import animation
 from tqdm import tqdm
 
 from ddpm_jax.helper_plot import hdr_plot_style, make_animation, plot_gradients
@@ -25,9 +29,16 @@ hdr_plot_style()
 
 DEVICE_0 = jax.devices()[0]
 
+print(jax.devices())
+
 Model = ModuleState[UNet]
 DM = tp.TypeVar("DM", bound="DiffusionModel")
 Logs = tp.Dict[str, jnp.ndarray]
+
+
+class VizType(enum.Enum):
+    LOCAL = enum.auto()
+    WANDB = enum.auto()
 
 
 def to_uint8_image(x: np.ndarray) -> np.ndarray:
@@ -124,56 +135,135 @@ def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2
     return np.asarray(betas)
 
 
+def format_for_wandb_video(
+    xs: np.ndarray, step_size=10, end_padding: int = 100, add_last_right: bool = True
+):
+
+    xs = np.asarray(xs)
+    xs = xs[::step_size]
+    xpad = einop(xs[-1], "... -> end_padding ...", end_padding=end_padding)
+    xs = np.concatenate([xs, xpad], axis=0)
+
+    if add_last_right:
+        xlast = einop(xs[-1], "... -> t ...", t=len(xs))
+        xs = np.concatenate([xs, xlast], axis=2)
+
+    xs = einop(xs, "t h w c -> t c h w")
+
+    return xs
+
+
 def plot_trajectory(
-    x_seq: np.ndarray,
+    xs: np.ndarray,
     n_plots: int = 10,
     max_timestep: tp.Optional[int] = None,
     reverse: bool = False,
+    as_animation: bool = True,
+    interval: int = 10,
+    repeat_delay: int = 1000,
+    step_size: int = 10,
 ):
-    fig, axs = plt.subplots(1, n_plots, figsize=(3 * n_plots, 3))
-    idxs = np.linspace(0, len(x_seq) - 1, n_plots).astype(np.int32)
-    ts = np.linspace(
-        0,
-        max_timestep - 1 if max_timestep else len(x_seq) - 1,
-        n_plots,
-    ).astype(np.int32)
+    xs = xs[::step_size]
 
-    if reverse:
-        idxs = idxs[::-1]
-        ts = ts[::-1]
+    if as_animation:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from uuid import uuid4
 
-    for plot_i, (i, t) in enumerate(zip(idxs, ts)):
-        cur_x = x_seq[i]
-        axs[plot_i].imshow(cur_x.squeeze(), cmap="gray")
-        axs[plot_i].set_axis_off()
-        axs[plot_i].set_title("$q(\mathbf{x}_{" + str(t) + "})$")
+        from IPython import get_ipython
+        from IPython.display import HTML, Image, Markdown, display
+
+        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+        imshow_anim = axs[0].imshow(xs[0])
+        imshow_static = axs[1].imshow(xs[-1])
+
+        for ax in axs:
+            ax.axis("off")
+
+        xpad = einop(xs[-1], "... -> pad ...", pad=len(xs))
+        xs = np.concatenate([xs, xpad], axis=0)
+
+        N = len(xs)
+
+        def animate(i):
+            imshow_anim.set_array(xs[i])
+            return [imshow_anim, imshow_static]
+
+        anim = animation.FuncAnimation(
+            fig,
+            animate,
+            init_func=lambda: animate(0),
+            frames=np.linspace(0, N - 1, N, dtype=int),
+            interval=interval,
+            repeat_delay=repeat_delay,
+            blit=True,
+        )
+
+        if get_ipython():
+            with TemporaryDirectory() as tmpdir:
+                img_name = Path(tmpdir) / f"{uuid4()}.gif"
+                anim.save(str(img_name), writer="pillow", fps=60)
+                image_bytes = b64encode(img_name.read_bytes()).decode("utf-8")
+
+            display(HTML(f"""<img src='data:image/gif;base64,{image_bytes}'>"""))
+            del anim
+            plt.close()
+        else:
+            plt.show()
+    else:
+        idxs = np.linspace(0, len(xs) - 1, n_plots).astype(np.int32)
+        ts = np.linspace(
+            0,
+            max_timestep - 1 if max_timestep else len(xs) - 1,
+            n_plots,
+        ).astype(np.int32)
+
+        if reverse:
+            idxs = idxs[::-1]
+            ts = ts[::-1]
+
+        fig, axs = plt.subplots(1, n_plots, figsize=(3 * n_plots, 3))
+
+        for plot_i, (i, t) in enumerate(zip(idxs, ts)):
+            axs[plot_i].imshow(xs[i].squeeze())
+            axs[plot_i].set_axis_off()
+            axs[plot_i].set_title("$q(\mathbf{x}_{" + str(t) + "})$")
 
 
-def plot_data(
+def forward_sample(
     key: jnp.ndarray,
     X: np.ndarray,
     timesteps: int,
-    beta: np.ndarray,
     diffusion: GaussianDiffusion,
 ):
-    x_seq = diffusion.forward_sample(
+    xs = diffusion.forward_sample(
         key,
         einop(X[0], "... -> batch ...", batch=timesteps),
         np.linspace(0, timesteps - 1, timesteps).astype(np.int32),
     )[0]
-    x_seq = to_uint8_image(x_seq)
+    xs = np.asarray(xs)
+    xs = to_uint8_image(xs)
+    return xs
 
-    plot_trajectory(x_seq, n_plots=5, max_timestep=timesteps)
+
+def plot_data(
+    X: np.ndarray,
+    xs: np.ndarray,
+    timesteps: int,
+    beta: np.ndarray,
+):
 
     # plot 8 random mnist images using subplots
-    fig, ax = plt.subplots(2, 4, figsize=(12, 6))
+    sammples_fig, ax = plt.subplots(2, 4, figsize=(12, 6))
     for i in range(8):
         xi = to_uint8_image(X[i])
         ax[i // 4, i % 4].imshow(xi.squeeze(), cmap="gray")
         ax[i // 4, i % 4].set_axis_off()
 
-    plt.figure(figsize=(16, 12))
+    beta_fig = plt.figure(figsize=(16, 12))
     plt.scatter(np.arange(timesteps), beta)
+
+    return sammples_fig, beta_fig
 
 
 class DiffusionModel(CoreModule):
@@ -181,7 +271,7 @@ class DiffusionModel(CoreModule):
     image_shape: tp.Tuple[int, ...]
     n_channels: int
     timesteps: int
-    viz: bool
+    viz: tp.Optional[VizType]
 
     # nodes
     key: tp.Optional[jnp.ndarray] = tx.node()
@@ -200,11 +290,11 @@ class DiffusionModel(CoreModule):
         dim_mults: tp.Sequence[int] = (1, 2, 4, 8),
         image_shape: tp.Sequence[int] = (64, 64),
         use_gradient_clipping: bool = True,
-        loss_type: str = "mse",
+        loss_type: str = "mae",
         train_lr: float = 3e-3,
         n_channels: int = 3,
         ema_decay: float = 0.9,
-        viz: bool = False,
+        viz: tp.Optional[VizType] = None,
     ):
         self.key = None
         self.model = Model(
@@ -233,7 +323,7 @@ class DiffusionModel(CoreModule):
         self.timesteps = timesteps
         self.viz = viz
 
-    # @partial(jax.jit, device=DEVICE_0)
+    # @partial(jax.jit, device=DEVICE_0) #) #) #, donate_argnums=0)
     @tx.toplevel_mutable
     def init_step(
         self, key: jnp.ndarray, batch: tp.Tuple[jnp.ndarray, jnp.ndarray]
@@ -241,15 +331,29 @@ class DiffusionModel(CoreModule):
         print("INIT_STEP")
         x, t = batch
 
-        if self.viz:
-            plot_data(
-                key,
-                x,
-                self.timesteps,
-                self.diffusion.beta,
-                self.diffusion,
-            )
-            plt.show()
+        if self.viz is not None:
+            xs = forward_sample(key, x, self.timesteps, self.diffusion)
+
+            if self.viz == VizType.LOCAL:
+                plot_data(
+                    x,
+                    xs,
+                    self.timesteps,
+                    self.diffusion,
+                )
+                plot_trajectory(xs, max_timestep=self.timesteps)
+                plt.show()
+            elif self.viz == VizType.WANDB:
+                xs = format_for_wandb_video(xs)
+                wandb.log(
+                    {
+                        # "real_samples": samples_fig,
+                        # "betas": beta_fig,
+                        "forward_diffusion": wandb.Video(xs, fps=60),
+                    }
+                )
+            else:
+                raise ValueError(f"Unknown viz type: {self.viz}")
 
         model_key, self.key = jax.random.split(key)
         self.model = self.model.init(model_key, x, t)
@@ -257,13 +361,12 @@ class DiffusionModel(CoreModule):
         self.ema = self.ema.init(self.model["params"])
         return self
 
-    @partial(jax.jit, device=DEVICE_0)
+    @partial(jax.jit, device=DEVICE_0)  # , donate_argnums=0)
     @tx.toplevel_mutable
     def reset_step(self: "DiffusionModel") -> "DiffusionModel":
         self.metrics = self.metrics.reset()
         return self
 
-    @partial(jax.jit, device=DEVICE_0)
     @tx.toplevel_mutable
     def noise_estimation_loss(
         self: "DiffusionModel",
@@ -289,7 +392,7 @@ class DiffusionModel(CoreModule):
 
         return loss, self
 
-    @partial(jax.jit, device=DEVICE_0)
+    @partial(jax.jit, device=DEVICE_0)  # , donate_argnums=0)
     @tx.toplevel_mutable
     def train_step(
         self: "DiffusionModel",
@@ -317,50 +420,74 @@ class DiffusionModel(CoreModule):
 
         return logs, self
 
-    def on_epoch_end(self: DM, epoch: int, logs: tp.Optional[Logs] = None) -> DM:
+    def on_epoch_end(
+        self: DM, epoch: int, logs: tp.Optional[tp.Dict[str, tp.Any]] = None
+    ) -> DM:
 
         if self.viz:
             assert self.key is not None
+            assert logs is not None
+
+            logs = logs.copy()
 
             print("Generating Sample...")
-            x_seq = self.diffusion.reverse_sample_loop(
+            xs = self.diffusion.reverse_sample_loop(
                 self.key, self.model, (1, *self.image_shape, self.n_channels)
             )
-            x_seq = to_uint8_image(x_seq)
+            xs = xs[:, 0]
+            xs = to_uint8_image(xs)
             print("Plotting...")
 
-            plot_trajectory(x_seq[::-1][:, 0], n_plots=7, reverse=True)
+            if self.viz == VizType.LOCAL:
+                plot_trajectory(xs, n_plots=7)
+                plt.show()
 
-            plt.show()
+            elif self.viz == VizType.WANDB:
+                # log video to wandb
+                xs = format_for_wandb_video(xs)
+                logs["reverse_diffusion"] = wandb.Video(xs, fps=60)
+                wandb.log(logs)
+            else:
+                raise ValueError(f"Unknown viz type: {self.viz}")
 
         return self
 
 
 def main(
-    step_per_epoch: int = 500,
+    steps_per_epoch: int = 500,
     total_steps: int = 100_000,
     timesteps: int = 1_000,
-    batch_size: int = 32,
-    viz: bool = True,
+    batch_size: int = 8,
+    viz: tp.Optional[str] = "wandb",
     schedule: str = "squared",
     tpu: bool = False,
-    image_shape: tp.List[int] = (64, 64),
+    image_shape: tp.List[int] = (32, 32),
     n_channels: int = 3,
     dataset_params: tp.List[str] = ("cgarciae/cartoonset", "10k"),
     dataset_type: str = "bytes",
-    dims: int = 32,
+    dims: int = 16,
     ema_decay: float = 0.9,
     train_lr: float = 3e-3,
-    loss_type: str = "mse",
+    loss_type: str = "mae",
     use_gradient_clipping: bool = True,
     dim_mults: tp.List[int] = (1, 2, 4, 8),
+    verbose: int = 1,
 ):
-    epochs = total_steps // step_per_epoch
+
+    epochs = total_steps // steps_per_epoch
 
     if tpu:
         from jax.tools import colab_tpu
 
         colab_tpu.setup_tpu()
+
+    if viz is not None:
+        _viz = VizType[viz.upper()]
+    else:
+        _viz = None
+
+    if _viz == VizType.WANDB:
+        wandb.init(project="ddpm-jax")
 
     ds = get_data(
         dataset_params=tuple(dataset_params),
@@ -386,7 +513,7 @@ def main(
         train_lr=train_lr,
         n_channels=n_channels,
         ema_decay=ema_decay,
-        viz=viz,
+        viz=_viz,
     )
 
     trainer = Trainer(module)
@@ -395,7 +522,8 @@ def main(
         ds,
         epochs=epochs,
         batch_size=batch_size,
-        steps_per_epoch=step_per_epoch,
+        steps_per_epoch=steps_per_epoch,
+        verbose=verbose,
     )
 
     return locals()
