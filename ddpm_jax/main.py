@@ -55,8 +55,6 @@ def get_data(
     channels: int,
     timesteps: int,
 ):
-    assert dataset_type in {"image", "bytes"}
-
     hfds = datasets.load.load_dataset(*dataset_params, split="train", cache_dir="data")
 
     img_key = [key for key in hfds.features.keys() if key.startswith("im")][0]
@@ -79,13 +77,15 @@ def get_data(
                 "img": tf.TensorSpec(shape=(None, None, channels), dtype=tf.uint8),
             },
         )
-    else:
+    elif dataset_type == "bytes":
         ds = tf.data.Dataset.from_generator(
             lambda: hfds,
             output_signature={
                 "img_bytes": tf.TensorSpec(shape=(), dtype=tf.string),
             },
         )
+    else:
+        raise ValueError(f"Unknown dataset type {dataset_type}")
 
     def process_fn(sample):
         x: tf.Tensor
@@ -296,6 +296,12 @@ class DiffusionModel(CoreModule):
         ema_decay: float = 0.9,
         viz: tp.Optional[VizType] = None,
     ):
+        if loss_type == "mse":
+            loss = jm.losses.MeanSquaredError()
+        elif loss_type == "mae":
+            loss = jm.losses.MeanAbsoluteError()
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
         self.key = None
         self.model = Model(
             UNet(
@@ -311,11 +317,7 @@ class DiffusionModel(CoreModule):
             )
         )
         self.diffusion = GaussianDiffusion(beta)
-        self.metrics = jm.LossesAndMetrics(
-            losses=jm.losses.MeanSquaredError()
-            if loss_type == "mse"
-            else jm.losses.MeanAbsoluteError()
-        )
+        self.metrics = jm.LossesAndMetrics(losses=loss)
         self.ema = EMA(ema_decay)
 
         self.image_shape = tuple(image_shape)
@@ -323,7 +325,7 @@ class DiffusionModel(CoreModule):
         self.timesteps = timesteps
         self.viz = viz
 
-    # @partial(jax.jit, device=DEVICE_0) #) #) #, donate_argnums=0)
+    # @partial(jax.jit) #) #) #, donate_argnums=0)
     @tx.toplevel_mutable
     def init_step(
         self, key: jnp.ndarray, batch: tp.Tuple[jnp.ndarray, jnp.ndarray]
@@ -361,7 +363,7 @@ class DiffusionModel(CoreModule):
         self.ema = self.ema.init(self.model["params"])
         return self
 
-    @partial(jax.jit, device=DEVICE_0)  # , donate_argnums=0)
+    @partial(jax.jit)  # , donate_argnums=0)
     @tx.toplevel_mutable
     def reset_step(self: "DiffusionModel") -> "DiffusionModel":
         self.metrics = self.metrics.reset()
@@ -392,7 +394,7 @@ class DiffusionModel(CoreModule):
 
         return loss, self
 
-    @partial(jax.jit, device=DEVICE_0)  # , donate_argnums=0)
+    @partial(jax.jit)  # , donate_argnums=0)
     @tx.toplevel_mutable
     def train_step(
         self: "DiffusionModel",
