@@ -1,5 +1,4 @@
 import enum
-import os
 import typing as tp
 from base64 import b64encode
 from functools import partial
@@ -107,10 +106,7 @@ def get_data(
 
         return x, t
 
-    # get number of cpus
-    nthreads = min(os.cpu_count() or 4, 24)
-
-    ds = ds.map(process_fn, num_parallel_calls=nthreads)
+    ds = ds.map(process_fn, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.repeat()
     ds = ds.shuffle(seed=42, buffer_size=1_000)
     ds = ds.batch(batch_size, drop_remainder=True)
@@ -137,6 +133,7 @@ def make_beta_schedule(schedule="linear", n_timesteps=1000, start=1e-5, end=1e-2
     else:
         raise ValueError(f"Unknown schedule {schedule}")
     return np.asarray(betas)
+
 
 def format_for_wandb_video(
     xs: np.ndarray, step_size=10, padding: int = 100
@@ -461,29 +458,26 @@ class DiffusionModel(CoreModule):
 
 def main(
     steps_per_epoch: int = 500,
-    total_samples: int = 64 * 500_000,
-    batch_size: int = 64,
+    total_steps: int = 100_000,
     timesteps: int = 1_000,
+    batch_size: int = 32,
     viz: tp.Optional[str] = "wandb",
     schedule: str = "squared",
     tpu: bool = False,
-    image_shape: str = "64x64",
+    image_shape: tp.List[int] = (64, 64),
     n_channels: int = 3,
-    dataset: str = "cgarciae/cartoonset,10k",
+    dataset_params: tp.List[str] = ("cgarciae/cartoonset", "10k"),
     dataset_type: str = "bytes",
     dims: int = 64,
     ema_decay: float = 0.9,
     train_lr: float = 3e-3,
     loss_type: str = "mae",
     use_gradient_clipping: bool = True,
-    dim_mults: str = "1,2,4,8",
+    dim_mults: tp.List[int] = (1, 2, 4, 8),
     verbose: int = 1,
 ):
 
-    epochs = total_samples // (batch_size * steps_per_epoch)
-    dataset_params = tuple(s for s in dataset.split(",") if s)
-    images_shape_ = tuple(int(s) for s in image_shape.split("x"))
-    dim_mults_ = tuple(int(s) for s in dim_mults.split(","))
+    epochs = total_steps // steps_per_epoch
 
     if tpu:
         from jax.tools import colab_tpu
@@ -499,10 +493,10 @@ def main(
         wandb.init(project="ddpm-jax")
 
     ds = get_data(
-        dataset_params=dataset_params,
+        dataset_params=tuple(dataset_params),
         dataset_type=dataset_type,
         batch_size=batch_size,
-        image_shape=images_shape_,
+        image_shape=tuple(image_shape),
         channels=n_channels,
         timesteps=timesteps,
     )
@@ -515,8 +509,8 @@ def main(
         beta=beta,
         timesteps=timesteps,
         dims=dims,
-        dim_mults=dim_mults_,
-        image_shape=images_shape_,
+        dim_mults=dim_mults,
+        image_shape=tuple(image_shape),
         use_gradient_clipping=use_gradient_clipping,
         loss_type=loss_type,
         train_lr=train_lr,
@@ -525,15 +519,33 @@ def main(
         viz=_viz,
     )
 
-    trainer = Trainer(module)
+    # trainer = Trainer(module)
 
-    trainer.fit(
-        ds,
-        epochs=epochs,
-        batch_size=batch_size,
-        steps_per_epoch=steps_per_epoch,
-        verbose=verbose,
-    )
+    # trainer.fit(
+    #     ds,
+    #     epochs=epochs,
+    #     batch_size=batch_size,
+    #     steps_per_epoch=steps_per_epoch,
+    #     verbose=verbose,
+    # )
+
+    ds_iterator = iter(ds)
+    logs = {}
+
+    batch = next(ds_iterator)
+    module = module.init_step(jax.random.PRNGKey(0), batch)
+
+    for epoch in range(epochs):
+        
+        module = module.reset_step()
+
+        for step in tqdm(range(steps_per_epoch), desc=f"Epoch {epoch}", unit="batches"):
+            batch = next(ds_iterator)
+
+            logs, module = module.train_step(batch, step, epoch)
+
+        module = module.on_epoch_end(epoch, logs)
+
 
     return locals()
 
