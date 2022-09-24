@@ -391,7 +391,7 @@ class GaussianDiffusion(to.Tree, to.Immutable):
         key = jax.random.split(key, len(x))
         return jax.vmap(_sample_fn)(key, noise_pred, x, t)
 
-    @partial(jax.jit, static_argnums=(3,), device=jax.devices()[0])
+    @partial(jax.jit, static_argnums=(3,))
     def reverse_sample_loop(
         self,
         key: jnp.ndarray,
